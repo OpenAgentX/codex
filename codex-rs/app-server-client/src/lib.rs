@@ -39,6 +39,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_core::AuthManager;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
@@ -59,6 +60,20 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// the same JSON-RPC result envelope used by socket/stdio transports because
 /// `MessageProcessor` continues to produce that shape internally.
 pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedClientArgs {
+    /// Client name reported during initialize.
+    pub client_name: String,
+    /// Client version reported during initialize.
+    pub client_version: String,
+    /// Whether experimental APIs are requested at initialize time.
+    pub experimental_api: bool,
+    /// Notification methods this client opts out of receiving.
+    pub opt_out_notification_methods: Vec<String>,
+    /// Queue capacity for command/event channels (clamped to at least 1).
+    pub channel_capacity: usize,
+}
 
 fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
     // These terminal events drive surface shutdown/completion state. Dropping
@@ -281,7 +296,35 @@ pub struct InProcessAppServerClient {
     thread_manager: Arc<ThreadManager>,
 }
 
+#[derive(Clone)]
+pub struct InProcessAppServerSender {
+    command_tx: mpsc::Sender<ClientCommand>,
+}
+
+pub struct InProcessAppServerEventStream {
+    event_rx: mpsc::Receiver<InProcessServerEvent>,
+}
+
+pub struct InProcessAppServerShutdown {
+    command_tx: mpsc::Sender<ClientCommand>,
+    worker_handle: tokio::task::JoinHandle<()>,
+}
+
+pub struct InProcessAppServerParts {
+    pub sender: InProcessAppServerSender,
+    pub events: InProcessAppServerEventStream,
+    pub shutdown: InProcessAppServerShutdown,
+    pub auth_manager: Arc<AuthManager>,
+    pub thread_manager: Arc<ThreadManager>,
+}
+
 impl InProcessAppServerClient {
+    /// Starts an embedded client with sensible defaults for non-Codex surfaces.
+    pub async fn start_embedded(args: EmbeddedClientArgs) -> IoResult<Self> {
+        let start_args = build_embedded_start_args(args).await?;
+        Self::start(start_args).await
+    }
+
     /// Starts the in-process runtime and facade worker task.
     ///
     /// The returned client is ready for requests and event consumption. If the
@@ -457,10 +500,119 @@ impl InProcessAppServerClient {
         self.thread_manager.clone()
     }
 
+    /// Splits the facade into independent sender/event/shutdown handles.
+    pub fn into_parts(self) -> InProcessAppServerParts {
+        let Self {
+            command_tx,
+            event_rx,
+            worker_handle,
+            auth_manager,
+            thread_manager,
+        } = self;
+
+        InProcessAppServerParts {
+            sender: InProcessAppServerSender {
+                command_tx: command_tx.clone(),
+            },
+            events: InProcessAppServerEventStream { event_rx },
+            shutdown: InProcessAppServerShutdown {
+                command_tx,
+                worker_handle,
+            },
+            auth_manager,
+            thread_manager,
+        }
+    }
+
     /// Sends a typed client request and returns raw JSON-RPC result.
     ///
     /// Callers that expect a concrete response type should usually prefer
     /// [`request_typed`](Self::request_typed).
+    pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
+        InProcessAppServerSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .request(request)
+        .await
+    }
+
+    /// Sends a typed client request and decodes the successful response body.
+    ///
+    /// This still deserializes from a JSON value produced by app-server's
+    /// JSON-RPC result envelope. Because the caller chooses `T`, `Deserialize`
+    /// failures indicate an internal request/response mismatch at the call site
+    /// (or an in-process bug), not transport skew from an external client.
+    pub async fn request_typed<T>(&self, request: ClientRequest) -> Result<T, TypedRequestError>
+    where
+        T: DeserializeOwned,
+    {
+        InProcessAppServerSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .request_typed(request)
+        .await
+    }
+
+    /// Sends a typed client notification.
+    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        InProcessAppServerSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .notify(notification)
+        .await
+    }
+
+    /// Resolves a pending server request.
+    ///
+    /// This should only be called with request IDs obtained from the current
+    /// client's event stream.
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        InProcessAppServerSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .resolve_server_request(request_id, result)
+        .await
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        InProcessAppServerSender {
+            command_tx: self.command_tx.clone(),
+        }
+        .reject_server_request(request_id, error)
+        .await
+    }
+
+    /// Returns the next in-process event, or `None` when worker exits.
+    ///
+    /// Callers are expected to drain this stream promptly. If they fall behind,
+    /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
+    /// pending server requests rather than letting approval flows hang.
+    pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// Shuts down worker and in-process runtime with bounded wait.
+    ///
+    /// If graceful shutdown exceeds timeout, the worker task is aborted to
+    /// avoid leaking background tasks in embedding callers.
+    pub async fn shutdown(self) -> IoResult<()> {
+        let parts = self.into_parts();
+        drop(parts.events);
+        parts.shutdown.shutdown().await
+    }
+}
+
+impl InProcessAppServerSender {
+    /// Sends a typed client request and returns raw JSON-RPC result.
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -590,7 +742,9 @@ impl InProcessAppServerClient {
             )
         })?
     }
+}
 
+impl InProcessAppServerEventStream {
     /// Returns the next in-process event, or `None` when worker exits.
     ///
     /// Callers are expected to drain this stream promptly. If they fall behind,
@@ -599,7 +753,9 @@ impl InProcessAppServerClient {
     pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
         self.event_rx.recv().await
     }
+}
 
+impl InProcessAppServerShutdown {
     /// Shuts down worker and in-process runtime with bounded wait.
     ///
     /// If graceful shutdown exceeds timeout, the worker task is aborted to
@@ -607,17 +763,13 @@ impl InProcessAppServerClient {
     pub async fn shutdown(self) -> IoResult<()> {
         let Self {
             command_tx,
-            event_rx,
             worker_handle,
-            auth_manager: _,
-            thread_manager: _,
         } = self;
         let mut worker_handle = worker_handle;
         // Drop the caller-facing receiver before asking the worker to shut
         // down. That unblocks any pending must-deliver `event_tx.send(..)`
         // so the worker can reach `handle.shutdown()` instead of timing out
         // and getting aborted with the runtime still attached.
-        drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
         if command_tx
             .send(ClientCommand::Shutdown { response_tx })
@@ -639,6 +791,53 @@ impl InProcessAppServerClient {
         }
         Ok(())
     }
+}
+
+async fn build_embedded_start_args(args: EmbeddedClientArgs) -> IoResult<InProcessClientStartArgs> {
+    let mut config_warnings = Vec::new();
+    let config = match ConfigBuilder::default().build().await {
+        Ok(config) => config,
+        Err(err) => {
+            config_warnings.push(ConfigWarningNotification {
+                summary: "Invalid configuration; using defaults.".to_string(),
+                details: Some(err.to_string()),
+                path: None,
+                range: None,
+            });
+            Config::load_default_with_cli_overrides(Vec::new()).map_err(|source| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("error loading default config after config error: {source}"),
+                )
+            })?
+        }
+    };
+
+    for warning in &config.startup_warnings {
+        config_warnings.push(ConfigWarningNotification {
+            summary: warning.clone(),
+            details: None,
+            path: None,
+            range: None,
+        });
+    }
+
+    Ok(InProcessClientStartArgs {
+        arg0_paths: Arg0DispatchPaths::default(),
+        config: Arc::new(config),
+        cli_overrides: Vec::new(),
+        loader_overrides: LoaderOverrides::default(),
+        cloud_requirements: CloudRequirementsLoader::default(),
+        feedback: CodexFeedback::new(),
+        config_warnings,
+        session_source: SessionSource::VSCode,
+        enable_codex_api_key_env: false,
+        client_name: args.client_name,
+        client_version: args.client_version,
+        experimental_api: args.experimental_api,
+        opt_out_notification_methods: args.opt_out_notification_methods,
+        channel_capacity: args.channel_capacity,
+    })
 }
 
 /// Extracts the JSON-RPC method name for diagnostics without extending the
@@ -870,6 +1069,55 @@ mod tests {
             event,
             Some(InProcessServerEvent::Lagged { skipped: 3 })
         ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn into_parts_preserves_request_and_shutdown_paths() {
+        let client = start_test_client(SessionSource::Exec).await;
+        let parts = client.into_parts();
+
+        let _response: ConfigRequirementsReadResponse = parts
+            .sender
+            .request_typed(ClientRequest::ConfigRequirementsRead {
+                request_id: RequestId::Integer(11),
+                params: None,
+            })
+            .await
+            .expect("typed request through split sender should succeed");
+
+        drop(parts.events);
+        parts
+            .shutdown
+            .shutdown()
+            .await
+            .expect("split shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn start_embedded_uses_default_embedded_settings() {
+        let client = InProcessAppServerClient::start_embedded(EmbeddedClientArgs {
+            client_name: "embedded-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("embedded start should succeed");
+
+        let parsed: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(12),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("thread/start should succeed");
+        assert_eq!(parsed.thread.source, ApiSessionSource::VSCode);
 
         client.shutdown().await.expect("shutdown should complete");
     }
