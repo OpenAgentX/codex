@@ -155,6 +155,63 @@ class ServerState:
         }
         return fake_jwt(payload)
 
+    def build_models_response(self) -> dict:
+        return {
+            "models": [
+                {
+                    "slug": self.args.model_slug,
+                    "display_name": self.args.model_display_name,
+                    "description": self.args.model_description,
+                    "default_reasoning_level": self.args.model_default_reasoning_level,
+                    "supported_reasoning_levels": [
+                        {
+                            "effort": "low",
+                            "description": "Fast responses with lighter reasoning",
+                        },
+                        {
+                            "effort": "medium",
+                            "description": "Balances speed and reasoning depth for everyday tasks",
+                        },
+                        {
+                            "effort": "high",
+                            "description": "Greater reasoning depth for complex problems",
+                        },
+                        {
+                            "effort": "xhigh",
+                            "description": "Extra high reasoning depth for complex problems",
+                        },
+                    ],
+                    "shell_type": "shell_command",
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "priority": self.args.model_priority,
+                    "availability_nux": None,
+                    "upgrade": None,
+                    "base_instructions": (
+                        "You are Codex, a coding agent running against the local "
+                        "mock ChatGPT account server."
+                    ),
+                    "supports_reasoning_summaries": True,
+                    "default_reasoning_summary": "auto",
+                    "support_verbosity": True,
+                    "default_verbosity": "low",
+                    "apply_patch_tool_type": "freeform",
+                    "web_search_tool_type": "text",
+                    "truncation_policy": {
+                        "mode": "tokens",
+                        "limit": self.args.model_truncation_limit,
+                    },
+                    "supports_parallel_tool_calls": True,
+                    "supports_image_detail_original": True,
+                    "context_window": self.args.model_context_window,
+                    "experimental_supported_tools": [],
+                    "input_modalities": ["text", "image"],
+                    "prefer_websockets": False,
+                    "supports_search_tool": False,
+                }
+            ]
+        }
+
     def create_auth_code(self, prefix: str) -> str:
         code = f"{prefix}-{secrets.token_urlsafe(12)}"
         with self.lock:
@@ -205,6 +262,9 @@ class MockHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             self.respond_json({"ok": True})
+            return
+        if parsed.path in {"/models", "/v1/models"}:
+            self.handle_models()
             return
         if parsed.path == "/oauth/authorize":
             self.handle_authorize(parsed)
@@ -273,9 +333,19 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def respond_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def respond_json(
+        self,
+        payload: dict,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: Optional[list[tuple[str, str]]] = None,
+    ) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_body(body, "application/json", status=status)
+        self.send_body(
+            body,
+            "application/json",
+            status=status,
+            extra_headers=extra_headers,
+        )
 
     def respond_html(
         self,
@@ -438,6 +508,12 @@ class MockHandler(BaseHTTPRequestHandler):
         self.respond_json(
             {"error": f"unsupported grant_type: {grant_type}"},
             status=HTTPStatus.BAD_REQUEST,
+        )
+
+    def handle_models(self) -> None:
+        self.respond_json(
+            self.server.state.build_models_response(),
+            extra_headers=[("ETag", self.server.state.args.models_etag)],
         )
 
     def handle_device_usercode(self) -> None:
@@ -703,6 +779,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--refresh-token", default="mock-chatgpt-refresh-token")
     parser.add_argument("--api-key", default="sk-mock-api-key")
+    parser.add_argument("--model-slug", default="gpt-5.3-codex")
+    parser.add_argument("--model-display-name", default="gpt-5.3-codex")
+    parser.add_argument(
+        "--model-description",
+        default="Mock remote model served by the local ChatGPT account server.",
+    )
+    parser.add_argument("--model-default-reasoning-level", default="medium")
+    parser.add_argument("--model-priority", type=int, default=0)
+    parser.add_argument("--model-context-window", type=int, default=272000)
+    parser.add_argument("--model-truncation-limit", type=int, default=10000)
+    parser.add_argument("--models-etag", default="mock-models-etag-v1")
     parser.add_argument("--primary-used-percent", type=int, default=42)
     parser.add_argument("--primary-window-mins", type=int, default=60)
     parser.add_argument("--primary-resets-in-secs", type=int, default=120)
@@ -741,6 +828,7 @@ def main() -> int:
     print(f"Mock account server listening on http://{args.host}:{args.port}")
     print(f"OAuth issuer: http://{args.host}:{args.port}")
     print(f"Browser login: {login_username} / {args.login_password}")
+    print(f"Models endpoints: http://{args.host}:{args.port}/models and /v1/models")
     print(f"Rate limit base URL: http://{args.host}:{args.port}")
     print(f"Device auth page: http://{args.host}:{args.port}/codex/device")
 

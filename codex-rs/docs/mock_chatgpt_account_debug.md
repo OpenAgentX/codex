@@ -10,6 +10,7 @@ The mock server in [scripts/mock_chatgpt_account_server.py](/D:/agentx/codex/cod
 - browser login via `/oauth/authorize`
 - device code login via `/api/accounts/deviceauth/*`
 - token exchange via `/oauth/token`
+- remote models via `/models` and `/v1/models`
 - ChatGPT rate limits via `/api/codex/usage`
 
 For browser login, the mock now emits JWT-shaped `id_token` and `access_token`
@@ -51,6 +52,7 @@ Useful options:
 Default endpoints after startup:
 
 - issuer: `http://127.0.0.1:8765`
+- models endpoints: `http://127.0.0.1:8765/models` and `http://127.0.0.1:8765/v1/models`
 - usage API base URL: `http://127.0.0.1:8765`
 - device code approval page: `http://127.0.0.1:8765/codex/device`
 - browser logout: `http://127.0.0.1:8765/oauth/logout`
@@ -113,6 +115,14 @@ The mock `/api/codex/usage` returns:
 - a primary window
 - a secondary window
 - any repeated `--additional-limit` buckets
+
+To point Codex's remote model discovery at the mock, set the OpenAI provider
+base URL to the mock `v1` root, for example:
+
+```toml
+[model_providers.openai]
+base_url = "http://127.0.0.1:8765/v1"
+```
 
 ## Current Limitation
 
