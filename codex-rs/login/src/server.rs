@@ -48,6 +48,7 @@ use tracing::warn;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
+pub const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_LOGIN_ISSUER_OVERRIDE";
 
 /// Options for launching the local login callback server.
 #[derive(Debug, Clone)]
@@ -73,7 +74,7 @@ impl ServerOptions {
         Self {
             codex_home,
             client_id,
-            issuer: DEFAULT_ISSUER.to_string(),
+            issuer: issuer_from_environment(),
             port: DEFAULT_PORT,
             open_browser: true,
             force_state: None,
@@ -81,6 +82,14 @@ impl ServerOptions {
             cli_auth_credentials_store_mode,
         }
     }
+}
+
+fn issuer_from_environment() -> String {
+    std::env::var(LOGIN_ISSUER_OVERRIDE_ENV_VAR)
+        .ok()
+        .map(|issuer| issuer.trim().to_string())
+        .filter(|issuer| !issuer.is_empty())
+        .unwrap_or_else(|| DEFAULT_ISSUER.to_string())
 }
 
 /// Handle for a running login callback server.
@@ -1088,12 +1097,16 @@ pub(crate) async fn obtain_api_key(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
+    use super::LOGIN_ISSUER_OVERRIDE_ENV_VAR;
+    use super::ServerOptions;
     use super::TokenEndpointErrorDetail;
     use super::parse_token_endpoint_error;
     use super::redact_sensitive_query_value;
     use super::redact_sensitive_url_parts;
     use super::sanitize_url_for_logging;
+    use codex_core::auth::AuthCredentialsStoreMode;
 
     #[test]
     fn parse_token_endpoint_error_prefers_error_description() {
@@ -1191,5 +1204,49 @@ mod tests {
             redacted,
             "https://example.com/base?token=%3Credacted%3E&env=prod".to_string()
         );
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: The test mutates a process env var in a bounded scope and
+            // restores the original value in Drop.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Restores the original process env value after the test.
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn server_options_uses_login_issuer_override_env_var() {
+        let _guard = EnvVarGuard::set(LOGIN_ISSUER_OVERRIDE_ENV_VAR, "http://127.0.0.1:8765");
+
+        let opts = ServerOptions::new(
+            PathBuf::from("codex-home"),
+            "client-id".to_string(),
+            None,
+            AuthCredentialsStoreMode::File,
+        );
+
+        assert_eq!(opts.issuer, "http://127.0.0.1:8765".to_string());
     }
 }

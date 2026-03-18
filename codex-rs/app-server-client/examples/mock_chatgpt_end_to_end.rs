@@ -60,6 +60,7 @@ type DynError = Box<dyn Error + Send + Sync>;
 const LOGIN_USERNAME: &str = "debug@example.com";
 const LOGIN_PASSWORD: &str = "debug-password";
 const MOCK_SERVER_PORT: u16 = 8765;
+const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_LOGIN_ISSUER_OVERRIDE";
 
 fn main() -> Result<(), DynError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -77,7 +78,9 @@ async fn async_main() -> Result<(), DynError> {
 
     let script_path = mock_server_script_path()?;
     let mock_port = MOCK_SERVER_PORT;
-    // let _mock_server = MockServer::start(&script_path, mock_port)?;
+    let _mock_server = MockServer::start(&script_path, mock_port)?;
+    let login_issuer = format!("http://127.0.0.1:{mock_port}");
+    let _login_issuer_guard = EnvVarGuard::set(LOGIN_ISSUER_OVERRIDE_ENV_VAR, &login_issuer);
     let refresh_url = format!("http://127.0.0.1:{mock_port}/oauth/token");
     let _refresh_url_guard = EnvVarGuard::set("CODEX_REFRESH_TOKEN_URL_OVERRIDE", &refresh_url);
     let openai_base_url = format!("http://127.0.0.1:{mock_port}/backend-api/codex");

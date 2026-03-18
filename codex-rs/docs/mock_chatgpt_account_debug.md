@@ -91,6 +91,13 @@ at the mock token endpoint before starting Codex:
 export CODEX_REFRESH_TOKEN_URL_OVERRIDE=http://127.0.0.1:8765/oauth/token
 ```
 
+If the login server default issuer is the production value
+`https://auth.openai.com`, also point ChatGPT login itself at the mock:
+
+```bash
+export CODEX_LOGIN_ISSUER_OVERRIDE=http://127.0.0.1:8765
+```
+
 ## Device Code Login Against The Mock
 
 ```bash
@@ -146,14 +153,7 @@ That combination covers the ChatGPT-mode defaults:
 - Browser task links: `/codex/tasks/<task_id>`
 - MCP apps: `/backend-api/wham/apps`
 
-## Current Limitation
+## App-Server ChatGPT Login
 
-This setup intentionally avoids adding a new Rust config surface for auth
-issuer injection in app-server/TUI.
-
-That means:
-
-- direct CLI login can point at the mock issuer today
-- TUI/app-server can consume the resulting local auth and mocked rate limits
-- app-server/TUI `account/login/start(type=chatgpt)` does not automatically use
-  the mock issuer unless a future Rust change adds that configuration path
+`account/login/start(type=chatgpt)` can now use the local mock issuer as long
+as `CODEX_LOGIN_ISSUER_OVERRIDE` is set before the app-server process starts.
