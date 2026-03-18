@@ -1754,7 +1754,7 @@ mod tests {
             })
             .await
             .expect("thread/start should succeed");
-        assert_eq!(parsed.thread.source, ApiSessionSource::VSCode);
+        assert_eq!(parsed.thread.source, ApiSessionSource::VsCode);
 
         client.shutdown().await.expect("shutdown should complete");
     }

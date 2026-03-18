@@ -8,7 +8,12 @@ Supported flows:
 - Browser login via `/oauth/authorize` -> local Codex callback.
 - Device code login via `/api/accounts/deviceauth/*` and `/codex/device`.
 - Token exchange via `/oauth/token`.
-- Rate limits via `/api/codex/usage`.
+- Token refresh via `/oauth/token` with `grant_type=refresh_token`.
+- Responses API via `/backend-api/codex/responses`.
+- Models API via `/backend-api/codex/models`.
+- ChatGPT backend helpers via `/backend-api/wham/*`.
+- Browser task pages via `/codex/tasks/<task_id>`.
+- Codex Apps MCP via `/backend-api/wham/apps`.
 
 The implementation uses only the Python standard library.
 """
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import secrets
@@ -51,6 +57,63 @@ def fake_jwt(payload: dict) -> str:
 
 def unix_now() -> int:
     return int(time.time())
+
+
+def iso8601_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def truncate_text(value: str, limit: int) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "..."
+
+
+def render_sse(events: list[dict]) -> bytes:
+    chunks: list[str] = []
+    for event in events:
+        kind = event.get("type", "message")
+        chunks.append(f"event: {kind}\n")
+        chunks.append(f"data: {json.dumps(event, separators=(',', ':'))}\n\n")
+    return "".join(chunks).encode("utf-8")
+
+
+def extract_text_fragments(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        text = value.get("text")
+        if isinstance(text, str):
+            fragments.append(text)
+        content = value.get("content")
+        if isinstance(content, list):
+            for item in content:
+                fragments.extend(extract_text_fragments(item))
+        input_items = value.get("input")
+        if isinstance(input_items, list):
+            for item in input_items:
+                fragments.extend(extract_text_fragments(item))
+        return fragments
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(extract_text_fragments(item))
+        return fragments
+    return []
+
+
+CONNECTOR_ID = "calendar"
+CONNECTOR_NAME = "Calendar"
+CONNECTOR_DESCRIPTION = "Plan events and manage your calendar."
+DISCOVERABLE_CALENDAR_ID = "connector_2128aebfecb84f64a069897515042a44"
+DISCOVERABLE_GMAIL_ID = "connector_68df038e0ba48191908c8434991bbac2"
+MCP_PROTOCOL_VERSION = "2025-11-25"
+MCP_SERVER_NAME = "mock-codex-apps"
+MCP_SERVER_VERSION = "1.0.0"
+CALENDAR_CREATE_EVENT_RESOURCE_URI = "connector://calendar/tools/calendar_create_event"
+CALENDAR_LIST_EVENTS_RESOURCE_URI = "connector://calendar/tools/calendar_list_events"
 
 
 @dataclass
@@ -118,11 +181,116 @@ class DeviceCodeRecord:
 
 
 @dataclass
+class TaskRecord:
+    task_id: str
+    title: str
+    created_at: float
+    updated_at: float
+    current_turn_id: str
+    user_turn_id: str
+    assistant_turn_id: str
+    user_prompt: str
+    assistant_response: str
+    archived: bool = False
+    has_unread_turn: bool = False
+
+    def as_task_response(self) -> dict:
+        return {
+            "id": self.task_id,
+            "created_at": self.created_at,
+            "title": self.title,
+            "has_generated_title": True,
+            "current_turn_id": self.current_turn_id,
+            "has_unread_turn": self.has_unread_turn,
+            "denormalized_metadata": None,
+            "archived": self.archived,
+            "external_pull_requests": [],
+        }
+
+    def as_list_item(self) -> dict:
+        return {
+            "id": self.task_id,
+            "title": self.title,
+            "has_generated_title": True,
+            "updated_at": self.updated_at,
+            "created_at": self.created_at,
+            "task_status_display": {
+                "status": "completed",
+                "label": "Completed",
+            },
+            "archived": self.archived,
+            "has_unread_turn": self.has_unread_turn,
+            "pull_requests": [],
+        }
+
+    def as_turn_details(self) -> dict:
+        return {
+            "task": self.as_task_response(),
+            "current_user_turn": {
+                "id": self.user_turn_id,
+                "attempt_placement": 0,
+                "turn_status": "completed",
+                "sibling_turn_ids": [],
+                "input_items": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "content_type": "text",
+                                "text": self.user_prompt,
+                            }
+                        ],
+                    }
+                ],
+                "output_items": [],
+                "worklog": {"messages": []},
+            },
+            "current_assistant_turn": {
+                "id": self.assistant_turn_id,
+                "attempt_placement": 0,
+                "turn_status": "completed",
+                "sibling_turn_ids": [],
+                "input_items": [],
+                "output_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "content_type": "text",
+                                "text": self.assistant_response,
+                            }
+                        ],
+                    }
+                ],
+                "worklog": {
+                    "messages": [
+                        {
+                            "author": {"role": "assistant"},
+                            "content": {
+                                "parts": [
+                                    {
+                                        "content_type": "text",
+                                        "text": self.assistant_response,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            },
+            "current_diff_task_turn": None,
+        }
+
+
+@dataclass
 class ServerState:
     args: argparse.Namespace
     device_codes: Dict[str, DeviceCodeRecord] = field(default_factory=dict)
     auth_codes: Dict[str, float] = field(default_factory=dict)
     browser_sessions: Dict[str, str] = field(default_factory=dict)
+    tasks: Dict[str, TaskRecord] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def build_auth_claims(self) -> dict:
@@ -253,6 +421,60 @@ class ServerState:
                 return None
             return record
 
+    def response_text_for_prompt(self, prompt: str) -> str:
+        template = self.args.responses_output_text
+        return (
+            template.replace("{prompt}", prompt)
+            .replace("{model}", self.args.model_slug)
+            .replace("{account_id}", self.args.chatgpt_account_id)
+        )
+
+    def title_for_prompt(self, prompt: str) -> str:
+        if prompt.strip():
+            return truncate_text(prompt, 72)
+        return f"{self.args.task_title_prefix} {len(self.tasks) + 1}"
+
+    def create_task(self, prompt: str) -> TaskRecord:
+        timestamp = time.time()
+        task_id = f"task_{secrets.token_hex(6)}"
+        user_turn_id = f"turn_user_{secrets.token_hex(4)}"
+        assistant_turn_id = f"turn_assistant_{secrets.token_hex(4)}"
+        record = TaskRecord(
+            task_id=task_id,
+            title=self.title_for_prompt(prompt),
+            created_at=timestamp,
+            updated_at=timestamp,
+            current_turn_id=assistant_turn_id,
+            user_turn_id=user_turn_id,
+            assistant_turn_id=assistant_turn_id,
+            user_prompt=prompt or "Mock task prompt",
+            assistant_response=self.response_text_for_prompt(prompt or "Mock task prompt"),
+        )
+        with self.lock:
+            self.tasks[task_id] = record
+        return record
+
+    def list_tasks(self) -> list[TaskRecord]:
+        with self.lock:
+            return sorted(
+                self.tasks.values(),
+                key=lambda task: task.updated_at,
+                reverse=True,
+            )
+
+    def get_task(self, task_id: str) -> Optional[TaskRecord]:
+        with self.lock:
+            return self.tasks.get(task_id)
+
+    def requirements_response(self) -> dict:
+        contents = self.args.requirements_contents
+        return {
+            "contents": contents,
+            "sha256": hashlib.sha256(contents.encode("utf-8")).hexdigest(),
+            "updated_at": iso8601_now(),
+            "updated_by_user_id": self.args.chatgpt_user_id,
+        }
+
 
 class MockHandler(BaseHTTPRequestHandler):
     server: "MockServer"
@@ -263,8 +485,23 @@ class MockHandler(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             self.respond_json({"ok": True})
             return
-        if parsed.path in {"/models", "/v1/models"}:
+        if parsed.path in {"/models", "/v1/models", "/backend-api/codex/models"}:
             self.handle_models()
+            return
+        if parsed.path == "/.well-known/oauth-authorization-server/mcp":
+            self.handle_mcp_oauth_metadata()
+            return
+        if parsed.path in {
+            "/connectors/directory/list",
+            "/backend-api/connectors/directory/list",
+        }:
+            self.handle_connectors_directory()
+            return
+        if parsed.path in {
+            "/connectors/directory/list_workspace",
+            "/backend-api/connectors/directory/list_workspace",
+        }:
+            self.handle_connectors_directory_workspace()
             return
         if parsed.path == "/oauth/authorize":
             self.handle_authorize(parsed)
@@ -275,8 +512,31 @@ class MockHandler(BaseHTTPRequestHandler):
         if parsed.path == "/codex/device":
             self.render_device_page(parsed, message=None)
             return
-        if parsed.path == "/api/codex/usage":
+        if parsed.path in {
+            "/api/codex/usage",
+            "/wham/usage",
+            "/backend-api/wham/usage",
+        }:
             self.handle_usage()
+            return
+        if parsed.path in {
+            "/api/codex/config/requirements",
+            "/wham/config/requirements",
+            "/backend-api/wham/config/requirements",
+        }:
+            self.handle_config_requirements()
+            return
+        if parsed.path in {
+            "/api/codex/tasks/list",
+            "/wham/tasks/list",
+            "/backend-api/wham/tasks/list",
+        }:
+            self.handle_task_list()
+            return
+        if parsed.path.startswith("/codex/tasks/"):
+            self.handle_task_page(parsed)
+            return
+        if self.try_handle_task_details(parsed.path):
             return
         if parsed.path == "/deviceauth/callback":
             self.respond_html(
@@ -297,6 +557,9 @@ class MockHandler(BaseHTTPRequestHandler):
         if parsed.path == "/oauth/token":
             self.handle_oauth_token()
             return
+        if parsed.path in {"/backend-api/codex/responses", "/v1/responses"}:
+            self.handle_responses()
+            return
         if parsed.path == "/api/accounts/deviceauth/usercode":
             self.handle_device_usercode()
             return
@@ -305,6 +568,20 @@ class MockHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/codex/device":
             self.handle_device_approval()
+            return
+        if parsed.path in {
+            "/api/codex/tasks",
+            "/wham/tasks",
+            "/backend-api/wham/tasks",
+        }:
+            self.handle_task_create()
+            return
+        if parsed.path in {
+            "/api/codex/apps",
+            "/wham/apps",
+            "/backend-api/wham/apps",
+        }:
+            self.handle_apps_json_rpc()
             return
         self.respond_json(
             {"error": f"unknown path: {parsed.path}"},
@@ -375,6 +652,53 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def parse_form_body(self) -> dict[str, list[str]]:
         return parse_qs(self.read_body().decode("utf-8"))
+
+    def parse_json_body(self) -> Optional[dict]:
+        try:
+            payload = json.loads(self.read_body().decode("utf-8"))
+        except json.JSONDecodeError:
+            self.respond_json(
+                {"error": "invalid json body"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return None
+        if not isinstance(payload, dict):
+            self.respond_json(
+                {"error": "expected top-level JSON object"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return None
+        return payload
+
+    def require_chatgpt_auth(self) -> bool:
+        auth_header = self.headers.get("authorization")
+        account_id = self.headers.get("chatgpt-account-id")
+        if auth_header is None or not auth_header.startswith("Bearer "):
+            self.respond_json(
+                {"error": "missing bearer token"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return False
+        if (
+            self.server.state.args.strict_account_header
+            and account_id != self.server.state.args.chatgpt_account_id
+        ):
+            self.respond_json(
+                {"error": "chatgpt-account-id mismatch"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return False
+        return True
+
+    def send_sse(self, events: list[dict]) -> None:
+        self.send_body(
+            render_sse(events),
+            "text/event-stream",
+            extra_headers=[
+                ("Cache-Control", "no-cache"),
+                ("Connection", "close"),
+            ],
+        )
 
     def browser_login_username(self) -> str:
         return self.server.state.args.login_username or self.server.state.args.email
@@ -502,6 +826,27 @@ class MockHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if grant_type == "refresh_token":
+            refresh_token = params.get("refresh_token", [""])[0]
+            if refresh_token != self.server.state.args.refresh_token:
+                self.respond_json(
+                    {
+                        "error": {
+                            "code": "refresh_token_invalidated",
+                            "message": "refresh token is not recognized by the mock server",
+                        }
+                    },
+                    status=HTTPStatus.UNAUTHORIZED,
+                )
+                return
+            self.respond_json(
+                {
+                    "id_token": self.server.state.build_id_token(),
+                    "access_token": self.server.state.build_access_token(),
+                    "refresh_token": self.server.state.args.refresh_token,
+                }
+            )
+            return
         if grant_type == "urn:ietf:params:oauth:grant-type:token-exchange":
             self.respond_json({"access_token": self.server.state.args.api_key})
             return
@@ -514,6 +859,75 @@ class MockHandler(BaseHTTPRequestHandler):
         self.respond_json(
             self.server.state.build_models_response(),
             extra_headers=[("ETag", self.server.state.args.models_etag)],
+        )
+
+    def handle_responses(self) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        payload = self.parse_json_body()
+        if payload is None:
+            return
+        prompt = "\n".join(extract_text_fragments(payload.get("input", []))).strip()
+        if not prompt:
+            prompt = payload.get("instructions", "").strip() or "Mock request"
+        response_id = f"resp_{secrets.token_hex(6)}"
+        message_id = f"msg_{secrets.token_hex(4)}"
+        output_text = self.server.state.response_text_for_prompt(prompt)
+        token_count = len(prompt.split()) + len(output_text.split())
+        print(f"Mocking response for prompt: {prompt}")
+        self.send_sse(
+            [
+                {
+                    "type": "response.created",
+                    "response": {"id": response_id},
+                },
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": message_id,
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "delta": output_text,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": message_id,
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": output_text,
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "output": [],
+                        "usage": {
+                            "input_tokens": max(1, len(prompt.split())),
+                            "input_tokens_details": None,
+                            "output_tokens": max(1, len(output_text.split())),
+                            "output_tokens_details": None,
+                            "total_tokens": max(2, token_count),
+                        },
+                    },
+                },
+            ]
         )
 
     def handle_device_usercode(self) -> None:
@@ -575,19 +989,7 @@ class MockHandler(BaseHTTPRequestHandler):
         self.respond_json(response)
 
     def handle_usage(self) -> None:
-        auth_header = self.headers.get("authorization")
-        account_id = self.headers.get("chatgpt-account-id")
-        if auth_header is None or not auth_header.startswith("Bearer "):
-            self.respond_json(
-                {"error": "missing bearer token"},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
-            return
-        if self.server.state.args.strict_account_header and account_id != self.server.state.args.chatgpt_account_id:
-            self.respond_json(
-                {"error": "chatgpt-account-id mismatch"},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
+        if not self.require_chatgpt_auth():
             return
 
         body = {
@@ -616,6 +1018,303 @@ class MockHandler(BaseHTTPRequestHandler):
                 "reset_at": unix_now() + self.server.state.args.secondary_resets_in_secs,
             }
         self.respond_json(body)
+
+    def handle_config_requirements(self) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        self.respond_json(self.server.state.requirements_response())
+
+    def handle_task_list(self) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        self.respond_json(
+            {
+                "items": [task.as_list_item() for task in self.server.state.list_tasks()],
+                "cursor": None,
+            }
+        )
+
+    def handle_task_create(self) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        payload = self.parse_json_body()
+        if payload is None:
+            return
+        prompt = "\n".join(extract_text_fragments(payload)).strip()
+        if not prompt:
+            for key in ("prompt", "title", "instructions"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    prompt = value.strip()
+                    break
+        task = self.server.state.create_task(prompt)
+        self.respond_json({"task": {"id": task.task_id}})
+
+    def try_handle_task_details(self, path: str) -> bool:
+        prefixes = [
+            "/api/codex/tasks/",
+            "/wham/tasks/",
+            "/backend-api/wham/tasks/",
+        ]
+        for prefix in prefixes:
+            if not path.startswith(prefix):
+                continue
+            remainder = path[len(prefix) :]
+            parts = [part for part in remainder.split("/") if part]
+            if len(parts) == 1:
+                self.handle_task_details(parts[0])
+                return True
+            if len(parts) == 4 and parts[1] == "turns" and parts[3] == "sibling_turns":
+                self.handle_sibling_turns(parts[0], parts[2])
+                return True
+        return False
+
+    def handle_task_details(self, task_id: str) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        task = self.server.state.get_task(task_id)
+        if task is None:
+            self.respond_json(
+                {"error": f"unknown task: {task_id}"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        self.respond_json(task.as_turn_details())
+
+    def handle_sibling_turns(self, task_id: str, turn_id: str) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        task = self.server.state.get_task(task_id)
+        if task is None:
+            self.respond_json(
+                {"error": f"unknown task: {task_id}"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        self.respond_json(
+            {
+                "sibling_turns": [
+                    {
+                        "id": turn_id,
+                        "task_id": task.task_id,
+                        "attempt_placement": 0,
+                    }
+                ]
+            }
+        )
+
+    def handle_task_page(self, parsed) -> None:
+        task_id = parsed.path.rsplit("/", 1)[-1]
+        task = self.server.state.get_task(task_id)
+        if task is None:
+            self.respond_html(
+                HTTPStatus.NOT_FOUND,
+                f"<html><body><h1>Unknown task</h1><p>{html.escape(task_id)}</p></body></html>",
+            )
+            return
+        body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(task.title)}</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 0; background: #f5f7fb; color: #111827; }}
+    .shell {{ max-width: 820px; margin: 4rem auto; background: white; border: 1px solid #d1d5db; border-radius: 16px; padding: 2rem; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.08); }}
+    pre {{ background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 12px; padding: 1rem; white-space: pre-wrap; }}
+    .meta {{ color: #6b7280; font-size: 0.95rem; }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <h1>{html.escape(task.title)}</h1>
+    <p class="meta">Task ID: <code>{html.escape(task.task_id)}</code></p>
+    <h2>User prompt</h2>
+    <pre>{html.escape(task.user_prompt)}</pre>
+    <h2>Assistant response</h2>
+    <pre>{html.escape(task.assistant_response)}</pre>
+  </div>
+</body>
+</html>"""
+        self.respond_html(HTTPStatus.OK, body)
+
+    def handle_mcp_oauth_metadata(self) -> None:
+        origin = f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        self.respond_json(
+            {
+                "authorization_endpoint": f"{origin}/oauth/authorize",
+                "token_endpoint": f"{origin}/oauth/token",
+                "scopes_supported": [""],
+            }
+        )
+
+    def handle_connectors_directory(self) -> None:
+        self.respond_json(
+            {
+                "apps": [
+                    {
+                        "id": DISCOVERABLE_CALENDAR_ID,
+                        "name": "Google Calendar",
+                        "description": "Plan events and schedules.",
+                    },
+                    {
+                        "id": DISCOVERABLE_GMAIL_ID,
+                        "name": "Gmail",
+                        "description": "Find and summarize email threads.",
+                    },
+                ],
+                "nextToken": None,
+            }
+        )
+
+    def handle_connectors_directory_workspace(self) -> None:
+        self.respond_json({"apps": [], "nextToken": None})
+
+    def handle_apps_json_rpc(self) -> None:
+        if not self.require_chatgpt_auth():
+            return
+        payload = self.parse_json_body()
+        if payload is None:
+            return
+        method = payload.get("method")
+        request_id = payload.get("id")
+        if not isinstance(method, str):
+            self.respond_json(
+                {"error": "missing method in JSON-RPC request"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if method == "initialize":
+            params = payload.get("params", {})
+            protocol_version = (
+                params.get("protocolVersion")
+                if isinstance(params, dict)
+                else None
+            ) or MCP_PROTOCOL_VERSION
+            self.respond_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "protocolVersion": protocol_version,
+                        "capabilities": {"tools": {"listChanged": True}},
+                        "serverInfo": {
+                            "name": MCP_SERVER_NAME,
+                            "version": MCP_SERVER_VERSION,
+                        },
+                    },
+                }
+            )
+            return
+
+        if method == "notifications/initialized" or method.startswith("notifications/"):
+            self.send_response(HTTPStatus.ACCEPTED.value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if method == "tools/list":
+            self.respond_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "calendar_create_event",
+                                "description": "Create a calendar event.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "starts_at": {"type": "string"},
+                                        "timezone": {"type": "string"},
+                                    },
+                                    "required": ["title", "starts_at"],
+                                    "additionalProperties": False,
+                                },
+                                "_meta": {
+                                    "connector_id": CONNECTOR_ID,
+                                    "connector_name": CONNECTOR_NAME,
+                                    "connector_description": CONNECTOR_DESCRIPTION,
+                                    "_codex_apps": {
+                                        "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
+                                        "contains_mcp_source": True,
+                                        "connector_id": CONNECTOR_ID,
+                                    },
+                                },
+                            },
+                            {
+                                "name": "calendar_list_events",
+                                "description": "List calendar events.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string"},
+                                        "limit": {"type": "integer"},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                "_meta": {
+                                    "connector_id": CONNECTOR_ID,
+                                    "connector_name": CONNECTOR_NAME,
+                                    "connector_description": CONNECTOR_DESCRIPTION,
+                                    "_codex_apps": {
+                                        "resource_uri": CALENDAR_LIST_EVENTS_RESOURCE_URI,
+                                        "contains_mcp_source": True,
+                                        "connector_id": CONNECTOR_ID,
+                                    },
+                                },
+                            },
+                        ],
+                        "nextCursor": None,
+                    },
+                }
+            )
+            return
+
+        if method == "tools/call":
+            params = payload.get("params", {})
+            arguments = params.get("arguments", {}) if isinstance(params, dict) else {}
+            codex_apps_meta = (
+                params.get("_meta", {}).get("_codex_apps")
+                if isinstance(params, dict)
+                and isinstance(params.get("_meta"), dict)
+                else None
+            )
+            tool_name = params.get("name", "") if isinstance(params, dict) else ""
+            title = arguments.get("title", "") if isinstance(arguments, dict) else ""
+            starts_at = arguments.get("starts_at", "") if isinstance(arguments, dict) else ""
+            self.respond_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"called {tool_name} for {title} at {starts_at}",
+                            }
+                        ],
+                        "structuredContent": {
+                            "_codex_apps": codex_apps_meta,
+                        },
+                        "isError": False,
+                    },
+                }
+            )
+            return
+
+        self.respond_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"method not found: {method}",
+                },
+            }
+        )
 
     def handle_device_approval(self) -> None:
         params = self.parse_form_body()
@@ -779,6 +1478,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--refresh-token", default="mock-chatgpt-refresh-token")
     parser.add_argument("--api-key", default="sk-mock-api-key")
+    parser.add_argument(
+        "--responses-output-text",
+        default="Mock response from {model} for: {prompt}",
+        help="Template used by /backend-api/codex/responses and generated task details.",
+    )
+    parser.add_argument(
+        "--requirements-contents",
+        default=(
+            "# mock requirements\n"
+            "[network]\n"
+            "allowed_domains = [\"api.openai.com\", \"chatgpt.com\"]\n"
+        ),
+        help="Contents returned by the mock requirements endpoint.",
+    )
+    parser.add_argument(
+        "--task-title-prefix",
+        default="Mock task",
+        help="Fallback prefix used when generated task titles have no prompt text.",
+    )
     parser.add_argument("--model-slug", default="gpt-5.3-codex")
     parser.add_argument("--model-display-name", default="gpt-5.3-codex")
     parser.add_argument(
@@ -828,8 +1546,11 @@ def main() -> int:
     print(f"Mock account server listening on http://{args.host}:{args.port}")
     print(f"OAuth issuer: http://{args.host}:{args.port}")
     print(f"Browser login: {login_username} / {args.login_password}")
-    print(f"Models endpoints: http://{args.host}:{args.port}/models and /v1/models")
-    print(f"Rate limit base URL: http://{args.host}:{args.port}")
+    print(
+        f"Models endpoints: http://{args.host}:{args.port}/models, /v1/models, and /backend-api/codex/models"
+    )
+    print(f"Responses endpoint: http://{args.host}:{args.port}/backend-api/codex/responses")
+    print(f"ChatGPT backend base URL: http://{args.host}:{args.port}/backend-api")
     print(f"Device auth page: http://{args.host}:{args.port}/codex/device")
 
     try:

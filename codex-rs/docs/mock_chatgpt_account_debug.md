@@ -10,8 +10,12 @@ The mock server in [scripts/mock_chatgpt_account_server.py](/D:/agentx/codex/cod
 - browser login via `/oauth/authorize`
 - device code login via `/api/accounts/deviceauth/*`
 - token exchange via `/oauth/token`
-- remote models via `/models` and `/v1/models`
-- ChatGPT rate limits via `/api/codex/usage`
+- token refresh via `/oauth/token` with `grant_type=refresh_token`
+- Responses API via `/backend-api/codex/responses`
+- remote models via `/models`, `/v1/models`, and `/backend-api/codex/models`
+- ChatGPT backend helpers via `/backend-api/wham/usage`, `/backend-api/wham/tasks*`,
+  `/backend-api/wham/config/requirements`, and `/backend-api/wham/apps`
+- browser task pages via `/codex/tasks/<task_id>`
 
 For browser login, the mock now emits JWT-shaped `id_token` and `access_token`
 payloads with `https://api.openai.com/auth` claims so they match Codex's local
@@ -52,8 +56,9 @@ Useful options:
 Default endpoints after startup:
 
 - issuer: `http://127.0.0.1:8765`
-- models endpoints: `http://127.0.0.1:8765/models` and `http://127.0.0.1:8765/v1/models`
-- usage API base URL: `http://127.0.0.1:8765`
+- ChatGPT backend base URL: `http://127.0.0.1:8765/backend-api`
+- models endpoints: `http://127.0.0.1:8765/models`, `http://127.0.0.1:8765/v1/models`, and `http://127.0.0.1:8765/backend-api/codex/models`
+- responses endpoint: `http://127.0.0.1:8765/backend-api/codex/responses`
 - device code approval page: `http://127.0.0.1:8765/codex/device`
 - browser logout: `http://127.0.0.1:8765/oauth/logout`
 
@@ -79,6 +84,13 @@ What happens:
 3. `codex login` exchanges that code at the mock `/oauth/token`.
 4. The returned fake JWT is persisted to local auth storage.
 
+To exercise ChatGPT token refresh against the mock, point the existing override
+at the mock token endpoint before starting Codex:
+
+```bash
+export CODEX_REFRESH_TOKEN_URL_OVERRIDE=http://127.0.0.1:8765/oauth/token
+```
+
 ## Device Code Login Against The Mock
 
 ```bash
@@ -95,10 +107,10 @@ Two ways to complete it:
 
 ## Rate Limits And TUI/App-Server Debugging
 
-Point `chatgpt_base_url` at the mock server. Example:
+Point `chatgpt_base_url` at the mock backend-api root. Example:
 
 ```toml
-chatgpt_base_url = "http://127.0.0.1:8765"
+chatgpt_base_url = "http://127.0.0.1:8765/backend-api/"
 ```
 
 There is a ready-to-copy example at [scripts/mock-chatgpt-account-config.toml.example](/D:/agentx/codex/codex-rs/scripts/mock-chatgpt-account-config.toml.example).
@@ -106,23 +118,33 @@ There is a ready-to-copy example at [scripts/mock-chatgpt-account-config.toml.ex
 Recommended workflow for TUI or app-server:
 
 1. Log in once with `codex login` against the mock issuer.
-2. Set `chatgpt_base_url` to the mock server.
-3. Start TUI or app-server normally.
-4. Call `account/read` and `account/rateLimits/read`.
+2. Set `chatgpt_base_url` to the mock backend-api root.
+3. Point the OpenAI model provider at the mock ChatGPT models endpoint.
+4. Optionally set `CODEX_REFRESH_TOKEN_URL_OVERRIDE` to the mock `/oauth/token`.
+5. Start TUI or app-server normally.
+6. Call `account/read`, `account/rateLimits/read`, or run normal turns.
 
-The mock `/api/codex/usage` returns:
+The mock `/backend-api/wham/usage` returns:
 
 - a primary window
 - a secondary window
 - any repeated `--additional-limit` buckets
 
-To point Codex's remote model discovery at the mock, set the OpenAI provider
-base URL to the mock `v1` root, for example:
+To point Codex's ChatGPT-mode model discovery at the mock, set the OpenAI
+provider base URL to the mock ChatGPT models root, for example:
 
 ```toml
 [model_providers.openai]
-base_url = "http://127.0.0.1:8765/v1"
+base_url = "http://127.0.0.1:8765/backend-api/codex"
 ```
+
+That combination covers the ChatGPT-mode defaults:
+
+- Responses: `/backend-api/codex/responses`
+- Models: `/backend-api/codex/models`
+- Rate limits and tasks: `/backend-api/wham/*`
+- Browser task links: `/codex/tasks/<task_id>`
+- MCP apps: `/backend-api/wham/apps`
 
 ## Current Limitation
 

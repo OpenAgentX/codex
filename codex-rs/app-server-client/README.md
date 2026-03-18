@@ -65,3 +65,35 @@ phase where they reconcile startup response data with later events.
 If the client falls behind on event consumption, the worker emits
 `InProcessServerEvent::Lagged` and may reject pending server requests so
 approval flows do not hang indefinitely behind a saturated queue.
+
+## Mock ChatGPT Example
+
+There is a runnable end-to-end example at
+`examples/mock_chatgpt_end_to_end.rs`. It starts the local
+`scripts/mock_chatgpt_account_server.py`, completes the ChatGPT browser-login
+flow automatically, then exercises:
+
+- `account/login/start`
+- `account/read` including refresh-token flow
+- `account/rateLimits/read`
+- `configRequirements/read`
+- `model/list`
+- `app/list`
+- `thread/start`
+- `turn/start`
+
+Run it from `codex-rs/` with:
+
+```bash
+cargo run -p codex-app-server-client --example mock_chatgpt_end_to_end
+```
+
+Requirements:
+
+- A working Python 3 interpreter available as `python`, `python3`, or `py -3`
+- The local mock server script at `scripts/mock_chatgpt_account_server.py`
+
+Optional environment overrides:
+
+- `PYTHON` to point at a specific Python executable
+- `CODEX_MOCK_CHATGPT_SERVER_PATH` to point at a different mock server script
