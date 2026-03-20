@@ -175,6 +175,28 @@ def extract_text_fragments(value) -> list[str]:
     return []
 
 
+def extract_items_by_type(value, item_types: set[str]) -> list[dict]:
+    if isinstance(value, dict):
+        items: list[dict] = []
+        if value.get("type") in item_types:
+            items.append(value)
+        content = value.get("content")
+        if isinstance(content, list):
+            for item in content:
+                items.extend(extract_items_by_type(item, item_types))
+        input_items = value.get("input")
+        if isinstance(input_items, list):
+            for item in input_items:
+                items.extend(extract_items_by_type(item, item_types))
+        return items
+    if isinstance(value, list):
+        items: list[dict] = []
+        for item in value:
+            items.extend(extract_items_by_type(item, item_types))
+        return items
+    return []
+
+
 CONNECTOR_ID = "calendar"
 CONNECTOR_NAME = "Calendar"
 CONNECTOR_DESCRIPTION = "Plan events and manage your calendar."
@@ -185,6 +207,12 @@ MCP_SERVER_NAME = "mock-codex-apps"
 MCP_SERVER_VERSION = "1.0.0"
 CALENDAR_CREATE_EVENT_RESOURCE_URI = "connector://calendar/tools/calendar_create_event"
 CALENDAR_LIST_EVENTS_RESOURCE_URI = "connector://calendar/tools/calendar_list_events"
+APPLY_PATCH_APPROVAL_DEMO_CALL_ID = "call_mock_apply_patch_approval_demo"
+APPLY_PATCH_APPROVAL_DEMO_FILE = "APPROVAL_DEMO.txt"
+APPLY_PATCH_APPROVAL_DEMO_TRIGGER = "mock apply_patch approval demo"
+APPLY_PATCH_APPROVAL_DEMO_FILE_CONTENT = (
+    "hello from the mock apply_patch approval demo\n"
+)
 
 
 @dataclass
@@ -781,13 +809,67 @@ class MockHandler(BaseHTTPRequestHandler):
             ],
         )
 
+    @staticmethod
+    def build_assistant_message_events(message_id: str, output_text: str) -> list[dict]:
+        return [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": message_id,
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "response.output_text.delta",
+                "delta": output_text,
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": message_id,
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": output_text,
+                        }
+                    ],
+                },
+            },
+        ]
+
+    @staticmethod
+    def approval_demo_patch() -> str:
+        return (
+            "*** Begin Patch\n"
+            f"*** Add File: {APPLY_PATCH_APPROVAL_DEMO_FILE}\n"
+            f"+{APPLY_PATCH_APPROVAL_DEMO_FILE_CONTENT.rstrip()}\n"
+            "*** End Patch\n"
+        )
+
+    @staticmethod
+    def is_apply_patch_approval_demo_prompt(prompt: str) -> bool:
+        return APPLY_PATCH_APPROVAL_DEMO_TRIGGER in prompt.lower()
+
+    def approval_demo_completed_text(self) -> str:
+        return (
+            "apply_patch approval demo completed: the client approved the "
+            f"file change and created {APPLY_PATCH_APPROVAL_DEMO_FILE}."
+        )
+
     def build_responses_events(self, payload: dict) -> list[dict]:
         prompt = "\n".join(extract_text_fragments(payload.get("input", []))).strip()
         if not prompt:
             prompt = payload.get("instructions", "").strip() or "Mock request"
         response_id = f"resp_{secrets.token_hex(6)}"
-        output_text = self.server.state.response_text_for_prompt(prompt)
-        token_count = len(prompt.split()) + len(output_text.split())
         print(f"Mocking response for prompt: {prompt}")
 
         events = [
@@ -797,44 +879,73 @@ class MockHandler(BaseHTTPRequestHandler):
             }
         ]
 
+        function_call_outputs = extract_items_by_type(
+            payload.get("input", []),
+            {"function_call_output", "custom_tool_call_output"},
+        )
+        if any(
+            item.get("call_id") == APPLY_PATCH_APPROVAL_DEMO_CALL_ID
+            for item in function_call_outputs
+        ):
+            output_text = self.approval_demo_completed_text()
+            token_count = len(prompt.split()) + len(output_text.split())
+            message_id = f"msg_{secrets.token_hex(4)}"
+            events.extend(self.build_assistant_message_events(message_id, output_text))
+            events.append(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "output": [],
+                        "usage": {
+                            "input_tokens": max(1, len(prompt.split())),
+                            "input_tokens_details": None,
+                            "output_tokens": max(1, len(output_text.split())),
+                            "output_tokens_details": None,
+                            "total_tokens": max(2, token_count),
+                        },
+                    },
+                }
+            )
+            return events
+
+        if self.is_apply_patch_approval_demo_prompt(prompt):
+            patch = self.approval_demo_patch()
+            events.append(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "name": "apply_patch",
+                        "arguments": json.dumps({"input": patch}, separators=(",", ":")),
+                        "call_id": APPLY_PATCH_APPROVAL_DEMO_CALL_ID,
+                    },
+                }
+            )
+            token_count = len(prompt.split())
+            events.append(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "output": [],
+                        "usage": {
+                            "input_tokens": max(1, len(prompt.split())),
+                            "input_tokens_details": None,
+                            "output_tokens": 1,
+                            "output_tokens_details": None,
+                            "total_tokens": max(2, token_count + 1),
+                        },
+                    },
+                }
+            )
+            return events
+
+        output_text = self.server.state.response_text_for_prompt(prompt)
+        token_count = len(prompt.split()) + len(output_text.split())
         if payload.get("generate") is not False:
             message_id = f"msg_{secrets.token_hex(4)}"
-            events.extend(
-                [
-                    {
-                        "type": "response.output_item.added",
-                        "item": {
-                            "type": "message",
-                            "role": "assistant",
-                            "id": message_id,
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": "",
-                                }
-                            ],
-                        },
-                    },
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": output_text,
-                    },
-                    {
-                        "type": "response.output_item.done",
-                        "item": {
-                            "type": "message",
-                            "role": "assistant",
-                            "id": message_id,
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": output_text,
-                                }
-                            ],
-                        },
-                    },
-                ]
-            )
+            events.extend(self.build_assistant_message_events(message_id, output_text))
 
         events.append(
             {

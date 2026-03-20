@@ -26,6 +26,8 @@ use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
+use codex_app_server_protocol::FileChangeApprovalDecision;
+use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
@@ -33,9 +35,14 @@ use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::PatchApplyStatus;
+use codex_app_server_protocol::ReadOnlyAccess;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
+use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -61,6 +68,7 @@ const LOGIN_USERNAME: &str = "debug@example.com";
 const LOGIN_PASSWORD: &str = "debug-password";
 const MOCK_SERVER_PORT: u16 = 8765;
 const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_LOGIN_ISSUER_OVERRIDE";
+const APPLY_PATCH_APPROVAL_PROMPT: &str = "Run the mock apply_patch approval demo: create APPROVAL_DEMO.txt using apply_patch, then briefly confirm that the client approved the file change.";
 
 fn main() -> Result<(), DynError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -78,7 +86,7 @@ async fn async_main() -> Result<(), DynError> {
 
     let script_path = mock_server_script_path()?;
     let mock_port = MOCK_SERVER_PORT;
-    // let _mock_server = MockServer::start(&script_path, mock_port)?;
+    let _mock_server = MockServer::start(&script_path, mock_port)?;
     let login_issuer = format!("http://127.0.0.1:{mock_port}");
     let _login_issuer_guard = EnvVarGuard::set(LOGIN_ISSUER_OVERRIDE_ENV_VAR, &login_issuer);
     let refresh_url = format!("http://127.0.0.1:{mock_port}/oauth/token");
@@ -87,8 +95,9 @@ async fn async_main() -> Result<(), DynError> {
     let _openai_base_url_guard = EnvVarGuard::set("OPENAI_BASE_URL", &openai_base_url);
     let cli_overrides = mock_cli_overrides(mock_port);
 
-    let config =
-        Arc::new(build_mock_config(mock_port, codex_home, workspace, &cli_overrides).await?);
+    let config = Arc::new(
+        build_mock_config(mock_port, codex_home, workspace.clone(), &cli_overrides).await?,
+    );
     let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
         arg0_paths: Arg0DispatchPaths::default(),
         config,
@@ -212,9 +221,9 @@ async fn async_main() -> Result<(), DynError> {
         .request_typed(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(8),
             params: ThreadStartParams {
-                approval_policy: Some(AskForApproval::Never),
+                approval_policy: Some(AskForApproval::OnRequest),
                 sandbox: Some(SandboxMode::DangerFullAccess),
-                cwd: Some(temp_dir.path().join("workspace").display().to_string()),
+                cwd: Some(workspace.display().to_string()),
                 ephemeral: Some(true),
                 ..ThreadStartParams::default()
             },
@@ -228,19 +237,33 @@ async fn async_main() -> Result<(), DynError> {
             params: TurnStartParams {
                 thread_id: thread.thread.id.clone(),
                 input: vec![UserInput::Text {
-                    text: "Use the mock ChatGPT account and say which endpoints were exercised."
-                        .to_string(),
+                    text: APPLY_PATCH_APPROVAL_PROMPT.to_string(),
                     text_elements: Vec::new(),
                 }],
+                cwd: Some(workspace.clone()),
+                approval_policy: Some(AskForApproval::OnRequest),
+                sandbox_policy: Some(SandboxPolicy::ReadOnly {
+                    access: ReadOnlyAccess::FullAccess,
+                    network_access: false,
+                }),
                 ..TurnStartParams::default()
             },
         })
         .await?;
     println!("turn started: {}", turn.turn.id);
 
-    let assistant_text =
+    let (assistant_text, file_change_approval_count, changed_paths) =
         wait_for_turn_completion(&mut client, &thread.thread.id, &turn.turn.id).await?;
+    if file_change_approval_count == 0 {
+        return Err("expected at least one file change approval request".into());
+    }
     println!("assistant output: {assistant_text}");
+    println!("file change approvals handled: {file_change_approval_count}");
+    if changed_paths.is_empty() {
+        println!("file change notifications did not report a resolved path");
+    } else {
+        println!("reported file change paths: {}", changed_paths.join(", "));
+    }
 
     client.shutdown().await?;
     Ok(())
@@ -361,9 +384,11 @@ async fn wait_for_turn_completion(
     client: &mut InProcessAppServerClient,
     thread_id: &str,
     turn_id: &str,
-) -> Result<String, DynError> {
+) -> Result<(String, usize, Vec<String>), DynError> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut assistant_text = String::new();
+        let mut file_change_approval_count = 0usize;
+        let mut changed_paths = Vec::new();
         loop {
             let event = client
                 .next_event()
@@ -382,7 +407,9 @@ async fn wait_for_turn_completion(
                     notification,
                 )) if notification.thread_id == thread_id && notification.turn.id == turn_id => {
                     match notification.turn.status {
-                        TurnStatus::Completed => return Ok(assistant_text),
+                        TurnStatus::Completed => {
+                            return Ok((assistant_text, file_change_approval_count, changed_paths));
+                        }
                         TurnStatus::Failed => {
                             let message = notification
                                 .turn
@@ -401,6 +428,43 @@ async fn wait_for_turn_completion(
                     notification,
                 )) if notification.thread_id == thread_id && notification.turn_id == turn_id => {
                     return Err(notification.error.message.into());
+                }
+                InProcessServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                    notification,
+                )) if notification.thread_id == thread_id && notification.turn_id == turn_id => {
+                    if let ThreadItem::FileChange { changes, .. } = notification.item {
+                        changed_paths.extend(changes.into_iter().map(|change| change.path));
+                    }
+                }
+                InProcessServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                    notification,
+                )) if notification.thread_id == thread_id && notification.turn_id == turn_id => {
+                    if let ThreadItem::FileChange {
+                        changes, status, ..
+                    } = notification.item
+                        && status == PatchApplyStatus::Completed
+                    {
+                        changed_paths.extend(changes.into_iter().map(|change| change.path));
+                    }
+                }
+                InProcessServerEvent::ServerRequest(ServerRequest::FileChangeRequestApproval {
+                    request_id,
+                    params,
+                }) if params.thread_id == thread_id && params.turn_id == turn_id => {
+                    file_change_approval_count += 1;
+                    println!(
+                        "file change approval requested: item={}, reason={:?}, grant_root={:?}",
+                        params.item_id, params.reason, params.grant_root
+                    );
+                    client
+                        .resolve_server_request(
+                            request_id,
+                            serde_json::to_value(FileChangeRequestApprovalResponse {
+                                decision: FileChangeApprovalDecision::Accept,
+                            })?,
+                        )
+                        .await?;
+                    println!("approved file change request for item {}", params.item_id);
                 }
                 InProcessServerEvent::ServerRequest(request) => {
                     return Err(
