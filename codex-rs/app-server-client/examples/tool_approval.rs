@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::error::Error;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,22 +53,27 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
+use codex_arg0::arg0_dispatch;
 use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 
-type DynError = Box<dyn std::error::Error + Send + Sync>;
+type DynError = Box<dyn Error + Send + Sync>;
 
 fn main() -> Result<(), DynError> {
+    let arg0_path_entry = arg0_dispatch();
+    let arg0_paths = arg0_path_entry
+        .as_ref()
+        .map_or_else(Arg0DispatchPaths::default, |entry| entry.paths().clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async_main())
+    runtime.block_on(async_main(arg0_paths))
 }
 
-async fn async_main() -> Result<(), DynError> {
+async fn async_main(arg0_paths: Arg0DispatchPaths) -> Result<(), DynError> {
     let prompt = env::args()
         .nth(1)
         .unwrap_or_else(|| "Create a file called hello.txt containing 'Hello World'".to_string());
@@ -75,7 +81,7 @@ async fn async_main() -> Result<(), DynError> {
     let config = Arc::new(ConfigBuilder::default().build().await?);
 
     let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
-        arg0_paths: Arg0DispatchPaths::default(),
+        arg0_paths,
         config,
         cli_overrides: Vec::new(),
         loader_overrides: LoaderOverrides::default(),
@@ -92,17 +98,14 @@ async fn async_main() -> Result<(), DynError> {
     })
     .await?;
 
-    // Start a thread with approval_policy = OnRequest so every tool call
-    // triggers an approval request back to this client.
+    // Start a thread with approval_policy = OnRequest and WorkspaceWrite so
+    // mutating actions like apply_patch flow through the normal approval path.
     let thread: ThreadStartResponse = client
         .request_typed(ClientRequest::ThreadStart {
             request_id: RequestId::Integer(1),
             params: ThreadStartParams {
                 approval_policy: Some(AskForApproval::OnRequest),
-                // Use DangerFullAccess to skip Windows sandbox setup refresh.
-                // For production use, prefer WorkspaceWrite or ReadOnly after
-                // running the sandbox setup (codex-windows-sandbox-setup.exe).
-                sandbox: Some(SandboxMode::DangerFullAccess),
+                sandbox: Some(SandboxMode::WorkspaceWrite),
                 ..ThreadStartParams::default()
             },
         })
@@ -199,9 +202,10 @@ async fn event_loop(
             }
 
             // ── 3. Permissions approval (network / filesystem) ───────────
-            InProcessServerEvent::ServerRequest(
-                ServerRequest::PermissionsRequestApproval { request_id, params },
-            ) => {
+            InProcessServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
+                request_id,
+                params,
+            }) => {
                 println!("┌─ Permissions Approval Request ─────────────────");
                 if let Some(reason) = &params.reason {
                     println!("│ reason:  {reason}");
@@ -232,7 +236,11 @@ async fn event_loop(
                 println!("┌─ Tool User Input Request ──────────────────────");
                 let mut answers_map = HashMap::new();
                 for question in &params.questions {
-                    println!("│ [{question_id}] {header}", question_id = question.id, header = question.header);
+                    println!(
+                        "│ [{question_id}] {header}",
+                        question_id = question.id,
+                        header = question.header
+                    );
                     println!("│   {}", question.question);
                     if let Some(options) = &question.options {
                         for (i, opt) in options.iter().enumerate() {
@@ -252,21 +260,25 @@ async fn event_loop(
                 }
                 println!("└────────────────────────────────────────────────");
 
-                let response = ToolRequestUserInputResponse { answers: answers_map };
+                let response = ToolRequestUserInputResponse {
+                    answers: answers_map,
+                };
                 client
                     .resolve_server_request(request_id, serde_json::to_value(response)?)
                     .await?;
             }
 
             // ── 5. MCP server elicitation ────────────────────────────────
-            InProcessServerEvent::ServerRequest(
-                ServerRequest::McpServerElicitationRequest { request_id, params },
-            ) => {
+            InProcessServerEvent::ServerRequest(ServerRequest::McpServerElicitationRequest {
+                request_id,
+                params,
+            }) => {
                 println!("┌─ MCP Elicitation Request ──────────────────────");
                 println!("│ server: {}", params.server_name);
                 match &params.request {
                     codex_app_server_protocol::McpServerElicitationRequest::Form {
-                        message, ..
+                        message,
+                        ..
                     } => {
                         println!("│ mode:    form");
                         println!("│ message: {message}");
@@ -448,7 +460,10 @@ fn ask_permissions_decision(
         )),
         _ => {
             println!("(denied)");
-            Ok((GrantedPermissionProfile::default(), PermissionGrantScope::Turn))
+            Ok((
+                GrantedPermissionProfile::default(),
+                PermissionGrantScope::Turn,
+            ))
         }
     }
 }

@@ -50,12 +50,13 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
+use codex_arg0::arg0_dispatch;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
-use codex_core::features::Feature;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use toml::Value as TomlValue;
@@ -71,13 +72,17 @@ const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_LOGIN_ISSUER_OVERRIDE";
 const APPLY_PATCH_APPROVAL_PROMPT: &str = "Run the mock apply_patch approval demo: create APPROVAL_DEMO.txt using apply_patch, then briefly confirm that the client approved the file change.";
 
 fn main() -> Result<(), DynError> {
+    let arg0_path_entry = arg0_dispatch();
+    let arg0_paths = arg0_path_entry
+        .as_ref()
+        .map_or_else(Arg0DispatchPaths::default, |entry| entry.paths().clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async_main())
+    runtime.block_on(async_main(arg0_paths))
 }
 
-async fn async_main() -> Result<(), DynError> {
+async fn async_main(arg0_paths: Arg0DispatchPaths) -> Result<(), DynError> {
     let temp_dir = TempDir::new("codex-app-server-client-mock-example")?;
     let codex_home = temp_dir.path().join("codex-home");
     let workspace = temp_dir.path().join("workspace");
@@ -99,7 +104,7 @@ async fn async_main() -> Result<(), DynError> {
         build_mock_config(mock_port, codex_home, workspace.clone(), &cli_overrides).await?,
     );
     let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
-        arg0_paths: Arg0DispatchPaths::default(),
+        arg0_paths,
         config,
         cli_overrides,
         loader_overrides: LoaderOverrides::default(),
