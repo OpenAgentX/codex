@@ -132,16 +132,18 @@ pub enum Feature {
     ChildAgentsMd,
     /// Allow the model to request `detail: "original"` image outputs on supported models.
     ImageDetailOriginal,
-    /// Enforce UTF8 output in Powershell.
-    PowershellUtf8,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
     Collab,
+    /// Enable task-path-based multi-agent routing.
+    MultiAgentV2,
     /// Enable CSV-backed agent job tools.
     SpawnCsv,
     /// Enable apps.
     Apps,
+    /// Enable the tool_search tool for apps.
+    ToolSearch,
     /// Enable discoverable tool suggestions for apps.
     ToolSuggest,
     /// Enable plugins.
@@ -688,18 +690,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::PowershellUtf8,
-        key: "powershell_utf8",
-        #[cfg(windows)]
-        stage: Stage::Stable,
-        #[cfg(windows)]
-        default_enabled: true,
-        #[cfg(not(windows))]
-        stage: Stage::UnderDevelopment,
-        #[cfg(not(windows))]
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::EnableRequestCompression,
         key: "enable_request_compression",
         stage: Stage::Stable,
@@ -712,6 +702,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::MultiAgentV2,
+        key: "multi_agent_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::SpawnCsv,
         key: "enable_fanout",
         stage: Stage::UnderDevelopment,
@@ -720,23 +716,25 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Apps,
         key: "apps",
-        stage: Stage::Experimental {
-            name: "Apps",
-            menu_description: "Use a connected ChatGPT App using \"$\". Install Apps via /apps command. Restart Codex after enabling.",
-            announcement: "NEW: Use ChatGPT Apps (Connectors) in Codex via $ mentions. Enable in /experimental and restart Codex!",
-        },
+        stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ToolSearch,
+        key: "tool_search",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ToolSuggest,
         key: "tool_suggest",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Plugins,
         key: "plugins",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
@@ -788,7 +786,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ToolCallMcpElicitation,
         key: "tool_call_mcp_elicitation",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
