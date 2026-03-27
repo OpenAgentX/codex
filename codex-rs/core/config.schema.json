@@ -338,9 +338,6 @@
             "apps": {
               "type": "boolean"
             },
-            "artifact": {
-              "type": "boolean"
-            },
             "child_agents_md": {
               "type": "boolean"
             },
@@ -1261,9 +1258,7 @@
       "type": "object"
     },
     "RawMcpServerConfig": {
-      "additionalProperties": {
-        "$ref": "#/definitions/McpServerToolConfig"
-      },
+      "additionalProperties": false,
       "properties": {
         "args": {
           "default": null,
@@ -1978,9 +1973,6 @@
           "type": "boolean"
         },
         "apps": {
-          "type": "boolean"
-        },
-        "artifact": {
           "type": "boolean"
         },
         "child_agents_md": {
