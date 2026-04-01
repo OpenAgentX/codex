@@ -39,6 +39,7 @@ members = [
     "lmstudio",
     "login",
     "mcp-server",
+    "mock-chatgpt-account-server",
     "network-proxy",
     "ollama",
     "process-hardening",
