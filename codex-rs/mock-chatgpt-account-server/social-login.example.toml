@@ -20,3 +20,13 @@ token_url = "https://github.com/login/oauth/access_token"
 user_info_url = "https://api.github.com/user"
 user_email_url = "https://api.github.com/user/emails"
 scopes = ["read:user", "user:email"]
+
+[[responses_proxy.upstreams]]
+name = "openai-primary"
+base_url = "https://api.openai.com/v1"
+api_key = "replace-with-upstream-api-key-1"
+
+[[responses_proxy.upstreams]]
+name = "openai-secondary"
+base_url = "https://example-openai-compatible.internal/v1"
+api_key = "replace-with-upstream-api-key-2"

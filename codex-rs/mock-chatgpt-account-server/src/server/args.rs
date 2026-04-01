@@ -25,8 +25,9 @@ pub struct MockServerArgs {
 
     #[arg(
         long,
+        visible_alias = "server-config",
         value_name = "FILE",
-        help = "Optional TOML file that configures Google/GitHub shortcut login buttons."
+        help = "Optional TOML file that configures Google/GitHub shortcut login buttons and responses proxy upstreams."
     )]
     pub social_login_config: Option<PathBuf>,
 
@@ -65,8 +66,28 @@ pub struct MockServerArgs {
     #[arg(long, default_value = "mock-chatgpt-refresh-token")]
     pub refresh_token: String,
 
-    #[arg(long, default_value = "sk-mock-api-key")]
+    #[arg(
+        long,
+        default_value = "sk-mock-api-key",
+        help = "Local mock API key returned by token exchange and required by backend-api endpoints."
+    )]
     pub api_key: String,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        requires = "responses_upstream_api_key",
+        help = "Legacy single upstream OpenAI-compatible base URL used to proxy responses requests. Accepts either .../v1 or a full .../responses URL."
+    )]
+    pub responses_upstream_base_url: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "KEY",
+        requires = "responses_upstream_base_url",
+        help = "Legacy single upstream API key used when proxying responses requests."
+    )]
+    pub responses_upstream_api_key: Option<String>,
 
     #[arg(
         long,
@@ -206,5 +227,11 @@ impl FromStr for LimitBucket {
                 .map_err(|_| "resets_in_secs must be an integer".to_string())?,
             limit_name: parts.get(4).map(|value| (*value).to_string()),
         })
+    }
+}
+
+impl MockServerArgs {
+    pub fn responses_proxy_enabled(&self) -> bool {
+        self.responses_upstream_base_url.is_some()
     }
 }

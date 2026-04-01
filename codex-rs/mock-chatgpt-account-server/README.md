@@ -14,7 +14,8 @@ cargo run -p codex-mock-chatgpt-account-server --bin mock_chatgpt_account_server
 
 The default server listens on `127.0.0.1:8765`.
 
-To enable Google and GitHub OAuth login buttons on the browser sign-in page, point the server at
+To enable Google and GitHub OAuth login buttons on the browser sign-in page, and optionally proxy
+`/backend-api/codex/responses` to real upstream OpenAI-compatible services, point the server at
 the bundled example TOML file:
 
 ```bash
@@ -55,7 +56,22 @@ token_url = "https://github.com/login/oauth/access_token"
 user_info_url = "https://api.github.com/user"
 user_email_url = "https://api.github.com/user/emails"
 scopes = ["read:user", "user:email"]
+
+[[responses_proxy.upstreams]]
+name = "openai-primary"
+base_url = "https://api.openai.com/v1"
+api_key = "replace-with-upstream-api-key-1"
+
+[[responses_proxy.upstreams]]
+name = "openai-secondary"
+base_url = "https://example-openai-compatible.internal/v1"
+api_key = "replace-with-upstream-api-key-2"
 ```
+
+When `responses_proxy.upstreams` is configured, the mock server still validates the local bearer
+token first, then proxies `/backend-api/codex/responses` and `/v1/responses` to the configured
+upstreams using round-robin load balancing. Each upstream `base_url` may be either a `.../v1`
+base or a full `.../responses` endpoint.
 
 ## Frontend
 

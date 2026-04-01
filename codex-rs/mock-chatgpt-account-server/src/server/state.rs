@@ -17,6 +17,7 @@ use crate::server::args::MockServerArgs;
 use crate::server::config::LoginUiConfig;
 use crate::server::config::OAuthSocialLoginProvider;
 use crate::server::config::SocialLoginProvider;
+use crate::server::responses_proxy::ResponsesProxy;
 
 pub const BROWSER_SESSION_COOKIE: &str = "mock_codex_browser_session";
 pub const CONNECTOR_ID: &str = "calendar";
@@ -41,6 +42,7 @@ pub const APPLY_PATCH_APPROVAL_DEMO_FILE_CONTENT: &str =
 pub struct AppState {
     pub args: MockServerArgs,
     login_ui_config: LoginUiConfig,
+    responses_proxy: ResponsesProxy,
     inner: Arc<RwLock<InnerState>>,
 }
 
@@ -123,10 +125,15 @@ pub enum DeviceTokenStatus {
 }
 
 impl AppState {
-    pub fn new(args: MockServerArgs, login_ui_config: LoginUiConfig) -> Self {
+    pub fn new(
+        args: MockServerArgs,
+        login_ui_config: LoginUiConfig,
+        responses_proxy: ResponsesProxy,
+    ) -> Self {
         Self {
             args,
             login_ui_config,
+            responses_proxy,
             inner: Arc::new(RwLock::new(InnerState::default())),
         }
     }
@@ -137,6 +144,10 @@ impl AppState {
 
     pub fn social_login_provider(&self, provider_id: &str) -> Option<&OAuthSocialLoginProvider> {
         self.login_ui_config.social_login_provider(provider_id)
+    }
+
+    pub fn responses_proxy(&self) -> &ResponsesProxy {
+        &self.responses_proxy
     }
 
     pub async fn create_social_login_state(&self, provider_id: &str, continue_to: &str) -> String {

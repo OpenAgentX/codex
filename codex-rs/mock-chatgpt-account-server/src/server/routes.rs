@@ -34,6 +34,7 @@ use crate::server::frontend::asset_bytes;
 use crate::server::frontend::render_page;
 use crate::server::responses::build_responses_events;
 use crate::server::responses::extract_text_fragments;
+use crate::server::responses_proxy::maybe_proxy_responses_request;
 use crate::server::state::AppState;
 use crate::server::state::BROWSER_SESSION_COOKIE;
 use crate::server::state::CALENDAR_CREATE_EVENT_RESOURCE_URI;
@@ -102,6 +103,11 @@ async fn dispatch_http(
     state: AppState,
 ) -> Result<Response, Infallible> {
     let path = full_path.as_str();
+    let target = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
     let response = match (method.clone(), path) {
         (Method::GET, "/healthz") => json_response(StatusCode::OK, &json!({ "ok": true })),
         (Method::GET, "/assets/app.css") => static_asset_response(StaticAsset::AppCss),
@@ -131,7 +137,7 @@ async fn dispatch_http(
         }
         (Method::POST, "/oauth/token") => handle_oauth_token(&state, &headers, &body),
         (Method::POST, "/backend-api/codex/responses") | (Method::POST, "/v1/responses") => {
-            handle_responses(&state, &headers, &body)
+            handle_responses(&state, &headers, &body).await
         }
         (Method::POST, "/api/accounts/deviceauth/usercode") => handle_device_usercode(&state).await,
         (Method::POST, "/api/accounts/deviceauth/token") => {
@@ -214,6 +220,12 @@ async fn dispatch_http(
             }
         }
     };
+    println!(
+        "[mock-account-server] {} {} -> {}",
+        method,
+        target,
+        response.status()
+    );
     Ok(response)
 }
 
@@ -341,6 +353,7 @@ fn handle_connectors_directory_workspace() -> Response {
 async fn handle_authorize(state: &AppState, query: &str, headers: &HeaderMap) -> Response {
     let params = parse_urlencoded(query);
     let Some(redirect_uri) = params.get("redirect_uri") else {
+        println!("[mock-account-server] /oauth/authorize rejected: missing redirect_uri");
         return json_response(
             StatusCode::BAD_REQUEST,
             &json!({ "error": "redirect_uri is required" }),
@@ -352,6 +365,9 @@ async fn handle_authorize(state: &AppState, query: &str, headers: &HeaderMap) ->
         .browser_session_username(browser_session.as_deref())
         .await
     else {
+        println!(
+            "[mock-account-server] /oauth/authorize requires login before redirecting to {redirect_uri}"
+        );
         let continue_to = if query.is_empty() {
             "/oauth/authorize".to_string()
         } else {
@@ -359,6 +375,9 @@ async fn handle_authorize(state: &AppState, query: &str, headers: &HeaderMap) ->
         };
         return browser_login_page(StatusCode::OK, state, headers, continue_to, None);
     };
+    println!(
+        "[mock-account-server] /oauth/authorize confirmed browser session for {session_username}, redirect_uri={redirect_uri}"
+    );
 
     let continue_to = if query.is_empty() {
         "/oauth/authorize".to_string()
@@ -395,6 +414,9 @@ async fn handle_authorize_approve(state: &AppState, headers: &HeaderMap, body: &
     );
     let browser_session = cookie_value(headers, BROWSER_SESSION_COOKIE);
     if !state.has_browser_session(browser_session.as_deref()).await {
+        println!(
+            "[mock-account-server] /oauth/authorize/approve rejected: expired browser session"
+        );
         return browser_login_page(
             StatusCode::UNAUTHORIZED,
             state,
@@ -410,6 +432,9 @@ async fn handle_authorize_approve(state: &AppState, headers: &HeaderMap, body: &
         .unwrap_or_default();
     let authorize_params = parse_urlencoded(authorize_query);
     let Some(redirect_uri) = authorize_params.get("redirect_uri") else {
+        println!(
+            "[mock-account-server] /oauth/authorize/approve rejected: continue_to missing redirect_uri"
+        );
         return json_response(
             StatusCode::BAD_REQUEST,
             &json!({ "error": "redirect_uri is required" }),
@@ -420,6 +445,9 @@ async fn handle_authorize_approve(state: &AppState, headers: &HeaderMap, body: &
     let code = state.create_auth_code("auth").await;
     let separator = if redirect_uri.contains('?') { "&" } else { "?" };
     let callback_url = format!("{redirect_uri}{separator}code={code}&state={state_value}");
+    println!(
+        "[mock-account-server] /oauth/authorize/approve issued auth code for redirect_uri={redirect_uri}"
+    );
     if accepts_json(headers) {
         json_response(
             StatusCode::OK,
@@ -443,6 +471,9 @@ async fn handle_browser_login(state: &AppState, headers: &HeaderMap, body: &Byte
             .cloned()
             .unwrap_or_else(|| "/oauth/authorize".to_string()),
     );
+    println!(
+        "[mock-account-server] /oauth/login attempt username={username}, continue_to={continue_to}"
+    );
 
     let expected_username = state
         .args
@@ -450,6 +481,7 @@ async fn handle_browser_login(state: &AppState, headers: &HeaderMap, body: &Byte
         .clone()
         .unwrap_or_else(|| state.args.email.clone());
     if username != expected_username || password != state.args.login_password {
+        println!("[mock-account-server] /oauth/login failed for username={username}");
         if accepts_json(headers) {
             return json_response(
                 StatusCode::UNAUTHORIZED,
@@ -470,6 +502,7 @@ async fn handle_browser_login(state: &AppState, headers: &HeaderMap, body: &Byte
 
     let session_id = state.create_browser_session(&username).await;
     let cookie = format!("{BROWSER_SESSION_COOKIE}={session_id}; HttpOnly; Path=/; SameSite=Lax");
+    println!("[mock-account-server] /oauth/login succeeded for username={username}");
     if accepts_json(headers) {
         let mut response = json_response(
             StatusCode::OK,
@@ -497,7 +530,13 @@ async fn handle_browser_shortcut_login(
             .cloned()
             .unwrap_or_else(|| "/oauth/authorize".to_string()),
     );
+    println!(
+        "[mock-account-server] /oauth/login/shortcut provider={provider_id}, continue_to={continue_to}"
+    );
     let Some(provider) = state.social_login_provider(&provider_id) else {
+        println!(
+            "[mock-account-server] /oauth/login/shortcut rejected: provider={provider_id} not configured"
+        );
         if accepts_json(headers) {
             return json_response(
                 StatusCode::BAD_REQUEST,
@@ -525,6 +564,9 @@ async fn handle_browser_shortcut_login(
     ) {
         Ok(authorize_url) => authorize_url,
         Err(error) => {
+            println!(
+                "[mock-account-server] /oauth/login/shortcut failed for provider={provider_id}: {error}"
+            );
             if accepts_json(headers) {
                 return json_response(
                     StatusCode::BAD_REQUEST,
@@ -543,6 +585,9 @@ async fn handle_browser_shortcut_login(
             );
         }
     };
+    println!(
+        "[mock-account-server] /oauth/login/shortcut redirecting provider={provider_id} to upstream authorize URL"
+    );
     if accepts_json(headers) {
         return json_response(
             StatusCode::OK,
@@ -562,7 +607,11 @@ async fn handle_browser_shortcut_callback(
     provider_id: &str,
 ) -> Response {
     let default_continue_to = "/oauth/authorize".to_string();
+    println!("[mock-account-server] /oauth/login/{provider_id}/callback query={query}");
     let Some(provider) = state.social_login_provider(provider_id).cloned() else {
+        println!(
+            "[mock-account-server] /oauth/login/{provider_id}/callback rejected: provider not configured"
+        );
         return browser_login_page(
             StatusCode::BAD_REQUEST,
             state,
@@ -573,6 +622,9 @@ async fn handle_browser_shortcut_callback(
     };
     let params = parse_urlencoded(query);
     let Some(oauth_state) = params.get("state").cloned() else {
+        println!(
+            "[mock-account-server] /oauth/login/{provider_id}/callback rejected: missing state"
+        );
         return browser_login_page(
             StatusCode::BAD_REQUEST,
             state,
@@ -588,6 +640,9 @@ async fn handle_browser_shortcut_callback(
         .consume_social_login_continue_to(provider_id, &oauth_state)
         .await
     else {
+        println!(
+            "[mock-account-server] /oauth/login/{provider_id}/callback rejected: invalid or expired state"
+        );
         return browser_login_page(
             StatusCode::BAD_REQUEST,
             state,
@@ -604,6 +659,9 @@ async fn handle_browser_shortcut_callback(
             .get("error_description")
             .cloned()
             .unwrap_or_else(|| error_code.clone());
+        println!(
+            "[mock-account-server] /oauth/login/{provider_id}/callback upstream error: {error_message}"
+        );
         return browser_login_page(
             StatusCode::BAD_REQUEST,
             state,
@@ -613,6 +671,9 @@ async fn handle_browser_shortcut_callback(
         );
     }
     let Some(code) = params.get("code").cloned() else {
+        println!(
+            "[mock-account-server] /oauth/login/{provider_id}/callback rejected: missing authorization code"
+        );
         return browser_login_page(
             StatusCode::BAD_REQUEST,
             state,
@@ -633,6 +694,10 @@ async fn handle_browser_shortcut_callback(
         .await
     {
         Ok(identity) => {
+            println!(
+                "[mock-account-server] /oauth/login/{provider_id}/callback resolved identity={}",
+                identity.session_username
+            );
             let session_id = state
                 .create_browser_session(&identity.session_username)
                 .await;
@@ -640,13 +705,18 @@ async fn handle_browser_shortcut_callback(
                 format!("{BROWSER_SESSION_COOKIE}={session_id}; HttpOnly; Path=/; SameSite=Lax");
             redirect_response(&continue_to, Some(cookie))
         }
-        Err(error) => browser_login_page(
-            StatusCode::BAD_GATEWAY,
-            state,
-            headers,
-            continue_to,
-            Some(format!("{} login failed: {error}", provider.label)),
-        ),
+        Err(error) => {
+            println!(
+                "[mock-account-server] /oauth/login/{provider_id}/callback exchange failed: {error}"
+            );
+            browser_login_page(
+                StatusCode::BAD_GATEWAY,
+                state,
+                headers,
+                continue_to,
+                Some(format!("{} login failed: {error}", provider.label)),
+            )
+        }
     }
 }
 
@@ -662,6 +732,7 @@ async fn handle_browser_logout(state: &AppState, query: &str, headers: &HeaderMa
     state
         .clear_browser_session(browser_session.as_deref())
         .await;
+    println!("[mock-account-server] /oauth/logout cleared browser session");
 
     redirect_response(
         &continue_to,
@@ -673,16 +744,33 @@ async fn handle_browser_logout(state: &AppState, query: &str, headers: &HeaderMa
 
 fn handle_oauth_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Response {
     let content_type = header_value(headers, CONTENT_TYPE.as_str()).unwrap_or_default();
-    if !content_type.contains("application/x-www-form-urlencoded") {
+    println!("[mock-account-server] /oauth/token content_type={content_type}");
+    let params = if content_type.contains("application/x-www-form-urlencoded") {
+        parse_urlencoded_body(body)
+    } else if content_type.contains("application/json") {
+        let payload = match parse_json_object(body) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        payload
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+            .collect()
+    } else {
+        println!(
+            "[mock-account-server] /oauth/token rejected unsupported content_type={content_type}"
+        );
         return json_response(
             StatusCode::BAD_REQUEST,
-            &json!({ "error": "expected application/x-www-form-urlencoded" }),
+            &json!({ "error": "expected application/json or application/x-www-form-urlencoded" }),
         );
-    }
-
-    let params = parse_urlencoded_body(body);
+    };
     let grant_type = params.get("grant_type").cloned().unwrap_or_default();
+    println!("[mock-account-server] /oauth/token grant_type={grant_type}");
     if grant_type == "authorization_code" {
+        println!("[mock-account-server] /oauth/token issuing authorization_code tokens");
         return json_response(
             StatusCode::OK,
             &json!({
@@ -695,6 +783,7 @@ fn handle_oauth_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Re
     if grant_type == "refresh_token" {
         let refresh_token = params.get("refresh_token").cloned().unwrap_or_default();
         if refresh_token != state.args.refresh_token {
+            println!("[mock-account-server] /oauth/token rejected refresh_token: token mismatch");
             return json_response(
                 StatusCode::UNAUTHORIZED,
                 &json!({
@@ -705,6 +794,7 @@ fn handle_oauth_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Re
                 }),
             );
         }
+        println!("[mock-account-server] /oauth/token refresh_token accepted");
         return json_response(
             StatusCode::OK,
             &json!({
@@ -715,11 +805,13 @@ fn handle_oauth_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Re
         );
     }
     if grant_type == "urn:ietf:params:oauth:grant-type:token-exchange" {
+        println!("[mock-account-server] /oauth/token issuing token-exchange api key");
         return json_response(
             StatusCode::OK,
             &json!({ "access_token": state.args.api_key }),
         );
     }
+    println!("[mock-account-server] /oauth/token rejected unsupported grant_type={grant_type}");
 
     json_response(
         StatusCode::BAD_REQUEST,
@@ -727,8 +819,11 @@ fn handle_oauth_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Re
     )
 }
 
-fn handle_responses(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Response {
+async fn handle_responses(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Response {
     if let Err(response) = require_chatgpt_auth(state, headers) {
+        return response;
+    }
+    if let Some(response) = maybe_proxy_responses_request(state, headers, body).await {
         return response;
     }
     let payload = match parse_json_object(body) {
@@ -1419,6 +1514,7 @@ mod tests {
     use super::*;
     use crate::server::MockServerArgs;
     use crate::server::config::load_login_ui_config;
+    use crate::server::responses_proxy::ResponsesProxy;
 
     fn test_filter() -> HttpRoute {
         test_filter_with_args(MockServerArgs::parse_from(["mock-server"]))
@@ -1427,7 +1523,13 @@ mod tests {
     fn test_filter_with_args(args: MockServerArgs) -> HttpRoute {
         let login_ui_config =
             load_login_ui_config(args.social_login_config.as_deref()).expect("login ui config");
-        let state = AppState::new(args, login_ui_config);
+        let responses_proxy = ResponsesProxy::load(
+            args.social_login_config.as_deref(),
+            args.responses_upstream_base_url.as_deref(),
+            args.responses_upstream_api_key.as_deref(),
+        )
+        .expect("responses proxy config");
+        let state = AppState::new(args, login_ui_config, responses_proxy);
         routes(state)
     }
 
@@ -1651,6 +1753,48 @@ client_secret = "github-secret"
     }
 
     #[tokio::test]
+    async fn oauth_token_refresh_accepts_json_requests() {
+        let filter = test_filter();
+        let response = warp::test::request()
+            .method("POST")
+            .path("/oauth/token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"grant_type":"refresh_token","client_id":"app_EMoamEEZ73f0CkXaXp7hrann","refresh_token":"mock-chatgpt-refresh-token"}"#)
+            .reply(&filter)
+            .await;
+        let body = serde_json::from_slice::<Value>(response.body()).expect("oauth token json");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body.get("refresh_token"),
+            Some(&Value::String("mock-chatgpt-refresh-token".to_string()))
+        );
+        assert!(body.get("id_token").and_then(Value::as_str).is_some());
+        assert!(body.get("access_token").and_then(Value::as_str).is_some());
+    }
+
+    #[tokio::test]
+    async fn oauth_token_authorization_code_accepts_form_requests() {
+        let filter = test_filter();
+        let response = warp::test::request()
+            .method("POST")
+            .path("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("grant_type=authorization_code&code=auth-code")
+            .reply(&filter)
+            .await;
+        let body = serde_json::from_slice::<Value>(response.body()).expect("oauth token json");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body.get("refresh_token"),
+            Some(&Value::String("mock-chatgpt-refresh-token".to_string()))
+        );
+        assert!(body.get("id_token").and_then(Value::as_str).is_some());
+        assert!(body.get("access_token").and_then(Value::as_str).is_some());
+    }
+
+    #[tokio::test]
     async fn browser_login_json_redirect_preserves_full_continue_to_query() {
         let filter = test_filter();
         let continue_to = "/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcallback&state=test-state";
@@ -1858,7 +2002,7 @@ user_info_url = "https://provider.example/oauth/userinfo"
     #[tokio::test]
     async fn response_events_include_completion_sequence() {
         let args = MockServerArgs::parse_from(["mock-server"]);
-        let state = AppState::new(args, Default::default());
+        let state = AppState::new(args, Default::default(), ResponsesProxy::default());
         let event_types = build_responses_events(
             &state,
             &json!({

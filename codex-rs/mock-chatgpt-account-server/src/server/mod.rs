@@ -2,6 +2,7 @@ mod args;
 mod config;
 mod frontend;
 mod responses;
+mod responses_proxy;
 mod routes;
 mod state;
 
@@ -12,18 +13,25 @@ use anyhow::Result;
 
 pub use args::MockServerArgs;
 use config::load_login_ui_config;
+use responses_proxy::ResponsesProxy;
 use state::AppState;
 
 pub async fn run(args: MockServerArgs) -> Result<()> {
     let bind_addr = resolve_bind_addr(&args).await?;
     let login_ui_config = load_login_ui_config(args.social_login_config.as_deref())?;
+    let responses_proxy = ResponsesProxy::load(
+        args.social_login_config.as_deref(),
+        args.responses_upstream_base_url.as_deref(),
+        args.responses_upstream_api_key.as_deref(),
+    )?;
     let social_login_providers = login_ui_config
         .social_login_providers()
         .iter()
         .map(|provider| provider.id.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let state = AppState::new(args.clone(), login_ui_config);
+    let responses_proxy_upstreams = responses_proxy.upstream_labels();
+    let state = AppState::new(args.clone(), login_ui_config, responses_proxy);
     let login_username = args
         .login_username
         .clone()
@@ -46,6 +54,12 @@ pub async fn run(args: MockServerArgs) -> Result<()> {
         "Responses endpoint: http://{}:{}/backend-api/codex/responses",
         args.host, args.port
     );
+    if !responses_proxy_upstreams.is_empty() {
+        println!(
+            "Responses proxy upstreams: {}",
+            responses_proxy_upstreams.join(", ")
+        );
+    }
     println!(
         "ChatGPT backend base URL: http://{}:{}/backend-api",
         args.host, args.port
