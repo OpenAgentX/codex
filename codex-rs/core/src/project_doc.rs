@@ -21,10 +21,12 @@ use crate::config_loader::default_project_root_markers;
 use crate::config_loader::merge_toml_values;
 use crate::config_loader::project_root_markers_from_config;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_exec_server::Environment;
+use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use dunce::canonicalize as normalize_path;
-use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
+use std::io;
 use toml::Value as TomlValue;
 use tracing::error;
 
@@ -57,6 +59,7 @@ fn render_js_repl_instructions(config: &Config) -> Option<String> {
     section.push_str("- `codex.emitImage(...)` adds one image to the outer `js_repl` function output each time you call it, so you can call it multiple times to emit multiple images. It accepts a data URL, a single `input_image` item, an object like `{ bytes, mimeType }`, or a raw tool response object with exactly one image and no text. It rejects mixed text-and-image content.\n");
     section.push_str("- `codex.tool(...)` and `codex.emitImage(...)` keep stable helper identities across cells. Saved references and persisted objects can reuse them in later cells, but async callbacks that fire after a cell finishes still fail because no exec is active.\n");
     section.push_str("- Request full-resolution image processing with `detail: \"original\"` only when the `view_image` tool schema includes a `detail` argument. The same availability applies to `codex.emitImage(...)`: if `view_image.detail` is present, you may also pass `detail: \"original\"` there. Use this when high-fidelity image perception or precise localization is needed, especially for CUA agents.\n");
+    section.push_str("- Raw MCP image blocks can request the same behavior by returning `_meta: { \"codex/imageDetail\": \"original\" }` on the image content item.\n");
     section.push_str("- Example of sharing an in-memory Playwright screenshot: `await codex.emitImage({ bytes: await page.screenshot({ type: \"jpeg\", quality: 85 }), mimeType: \"image/jpeg\", detail: \"original\" })`.\n");
     section.push_str("- Example of sharing a local image tool result: `await codex.emitImage(codex.tool(\"view_image\", { path: \"/absolute/path\", detail: \"original\" }))`.\n");
     section.push_str("- When encoding an image to send with `codex.emitImage(...)` or `view_image`, prefer JPEG at about 85 quality when lossy compression is acceptable; use PNG when transparency or lossless detail matters. Smaller uploads are faster and less likely to hit size limits.\n");
@@ -76,8 +79,19 @@ fn render_js_repl_instructions(config: &Config) -> Option<String> {
 
 /// Combines `Config::instructions` and `AGENTS.md` (if present) into a single
 /// string of instructions.
-pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
-    let project_docs = read_project_docs(config).await;
+pub(crate) async fn get_user_instructions(
+    config: &Config,
+    environment: Option<&Environment>,
+) -> Option<String> {
+    let fs = environment?.get_filesystem();
+    get_user_instructions_with_fs(config, fs.as_ref()).await
+}
+
+pub(crate) async fn get_user_instructions_with_fs(
+    config: &Config,
+    fs: &dyn ExecutorFileSystem,
+) -> Option<String> {
+    let project_docs = read_project_docs_with_fs(config, fs).await;
 
     let mut output = String::new();
 
@@ -125,14 +139,25 @@ pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
 /// concatenation of all discovered docs. If no documentation file is found the
 /// function returns `Ok(None)`. Unexpected I/O failures bubble up as `Err` so
 /// callers can decide how to handle them.
-pub async fn read_project_docs(config: &Config) -> std::io::Result<Option<String>> {
+pub async fn read_project_docs(
+    config: &Config,
+    environment: &Environment,
+) -> io::Result<Option<String>> {
+    let fs = environment.get_filesystem();
+    read_project_docs_with_fs(config, fs.as_ref()).await
+}
+
+async fn read_project_docs_with_fs(
+    config: &Config,
+    fs: &dyn ExecutorFileSystem,
+) -> io::Result<Option<String>> {
     let max_total = config.project_doc_max_bytes;
 
     if max_total == 0 {
         return Ok(None);
     }
 
-    let paths = discover_project_doc_paths(config)?;
+    let paths = discover_project_doc_paths(config, fs).await?;
     if paths.is_empty() {
         return Ok(None);
     }
@@ -145,16 +170,22 @@ pub async fn read_project_docs(config: &Config) -> std::io::Result<Option<String
             break;
         }
 
-        let file = match tokio::fs::File::open(&p).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
+        match fs.get_metadata(&p, /*sandbox*/ None).await {
+            Ok(metadata) if !metadata.is_file => continue,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        }
 
-        let size = file.metadata().await?.len();
-        let mut reader = tokio::io::BufReader::new(file).take(remaining);
-        let mut data: Vec<u8> = Vec::new();
-        reader.read_to_end(&mut data).await?;
+        let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let size = data.len() as u64;
+        if size > remaining {
+            data.truncate(remaining as usize);
+        }
 
         if size > remaining {
             tracing::warn!(
@@ -183,10 +214,17 @@ pub async fn read_project_docs(config: &Config) -> std::io::Result<Option<String
 /// contents. The list is ordered from project root to the current working
 /// directory (inclusive). Symlinks are allowed. When `project_doc_max_bytes`
 /// is zero, returns an empty list.
-pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBuf>> {
-    let mut dir = config.cwd.to_path_buf();
+pub async fn discover_project_doc_paths(
+    config: &Config,
+    fs: &dyn ExecutorFileSystem,
+) -> io::Result<Vec<AbsolutePathBuf>> {
+    if config.project_doc_max_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut dir = config.cwd.clone();
     if let Ok(canon) = normalize_path(&dir) {
-        dir = canon;
+        dir = AbsolutePathBuf::try_from(canon)?;
     }
 
     let mut merged = TomlValue::Table(toml::map::Map::new());
@@ -212,13 +250,13 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
         for ancestor in dir.ancestors() {
             for marker in &project_root_markers {
                 let marker_path = ancestor.join(marker);
-                let marker_exists = match std::fs::metadata(&marker_path) {
+                let marker_exists = match fs.get_metadata(&marker_path, /*sandbox*/ None).await {
                     Ok(_) => true,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => return Err(e),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                    Err(err) => return Err(err),
                 };
                 if marker_exists {
-                    project_root = Some(ancestor.to_path_buf());
+                    project_root = Some(ancestor.clone());
                     break;
                 }
             }
@@ -228,11 +266,11 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
         }
     }
 
-    let search_dirs: Vec<PathBuf> = if let Some(root) = project_root {
+    let search_dirs: Vec<AbsolutePathBuf> = if let Some(root) = project_root {
         let mut dirs = Vec::new();
-        let mut cursor = dir.as_path();
+        let mut cursor = dir.clone();
         loop {
-            dirs.push(cursor.to_path_buf());
+            dirs.push(cursor.clone());
             if cursor == root {
                 break;
             }
@@ -247,29 +285,25 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
         vec![dir]
     };
 
-    let mut found: Vec<PathBuf> = Vec::new();
+    let mut found: Vec<AbsolutePathBuf> = Vec::new();
     let candidate_filenames = candidate_filenames(config);
     for d in search_dirs {
         for name in &candidate_filenames {
             let candidate = d.join(name);
-            match std::fs::symlink_metadata(&candidate) {
-                Ok(md) => {
-                    let ft = md.file_type();
-                    // Allow regular files and symlinks; opening will later fail for dangling links.
-                    if ft.is_file() || ft.is_symlink() {
-                        found.push(candidate);
-                        break;
-                    }
+            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
+                Ok(md) if md.is_file => {
+                    found.push(candidate);
+                    break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
             }
         }
     }
 
     Ok(found)
 }
-
 fn candidate_filenames<'a>(config: &'a Config) -> Vec<&'a str> {
     let mut names: Vec<&'a str> =
         Vec::with_capacity(2 + config.project_doc_fallback_filenames.len());

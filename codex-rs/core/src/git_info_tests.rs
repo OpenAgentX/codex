@@ -72,7 +72,7 @@ async fn create_test_git_repo(temp_dir: &TempDir) -> PathBuf {
 #[tokio::test]
 async fn test_recent_commits_non_git_directory_returns_empty() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let entries = recent_commits(temp_dir.path(), 10).await;
+    let entries = recent_commits(temp_dir.path(), /*limit*/ 10).await;
     assert!(entries.is_empty(), "expected no commits outside a git repo");
 }
 
@@ -133,7 +133,7 @@ async fn test_recent_commits_orders_and_limits() {
         .expect("git commit 3");
 
     // Request the latest 3 commits; should be our three changes in reverse time order.
-    let entries = recent_commits(&repo_path, 3).await;
+    let entries = recent_commits(&repo_path, /*limit*/ 3).await;
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].subject, "third change");
     assert_eq!(entries[1].subject, "second change");
@@ -426,10 +426,14 @@ async fn test_get_git_working_tree_state_branch_fallback() {
     assert_eq!(state.sha, GitSha::new(&remote_sha));
 }
 
-#[test]
-fn resolve_root_git_project_for_trust_returns_none_outside_repo() {
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_returns_none_outside_repo() {
     let tmp = TempDir::new().expect("tempdir");
-    assert!(resolve_root_git_project_for_trust(tmp.path()).is_none());
+    assert!(
+        resolve_root_git_project_for_trust(tmp.path())
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -439,12 +443,15 @@ async fn resolve_root_git_project_for_trust_regular_repo_returns_repo_root() {
     let expected = std::fs::canonicalize(&repo_path).unwrap();
 
     assert_eq!(
-        resolve_root_git_project_for_trust(&repo_path),
+        resolve_root_git_project_for_trust(&repo_path).await,
         Some(expected.clone())
     );
     let nested = repo_path.join("sub/dir");
     std::fs::create_dir_all(&nested).unwrap();
-    assert_eq!(resolve_root_git_project_for_trust(&nested), Some(expected));
+    assert_eq!(
+        resolve_root_git_project_for_trust(&nested).await,
+        Some(expected)
+    );
 }
 
 #[tokio::test]
@@ -467,18 +474,20 @@ async fn resolve_root_git_project_for_trust_detects_worktree_and_returns_main_ro
         .expect("git worktree add");
 
     let expected = std::fs::canonicalize(&repo_path).ok();
-    let got =
-        resolve_root_git_project_for_trust(&wt_root).and_then(|p| std::fs::canonicalize(p).ok());
+    let got = resolve_root_git_project_for_trust(&wt_root)
+        .await
+        .and_then(|p| std::fs::canonicalize(p).ok());
     assert_eq!(got, expected);
     let nested = wt_root.join("nested/sub");
     std::fs::create_dir_all(&nested).unwrap();
-    let got_nested =
-        resolve_root_git_project_for_trust(&nested).and_then(|p| std::fs::canonicalize(p).ok());
+    let got_nested = resolve_root_git_project_for_trust(&nested)
+        .await
+        .and_then(|p| std::fs::canonicalize(p).ok());
     assert_eq!(got_nested, expected);
 }
 
-#[test]
-fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git_command() {
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git_command() {
     let tmp = TempDir::new().expect("tempdir");
     let repo_root = tmp.path().join("repo");
     let common_dir = repo_root.join(".git");
@@ -495,17 +504,17 @@ fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git_comma
 
     let expected = std::fs::canonicalize(&repo_root).unwrap();
     assert_eq!(
-        resolve_root_git_project_for_trust(&worktree_root),
+        resolve_root_git_project_for_trust(&worktree_root).await,
         Some(expected.clone())
     );
     assert_eq!(
-        resolve_root_git_project_for_trust(&worktree_root.join("nested")),
+        resolve_root_git_project_for_trust(&worktree_root.join("nested")).await,
         Some(expected)
     );
 }
 
-#[test]
-fn resolve_root_git_project_for_trust_non_worktrees_gitdir_returns_none() {
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_non_worktrees_gitdir_returns_none() {
     let tmp = TempDir::new().expect("tempdir");
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(proj.join("nested")).unwrap();
@@ -520,8 +529,12 @@ fn resolve_root_git_project_for_trust_non_worktrees_gitdir_returns_none() {
     )
     .unwrap();
 
-    assert!(resolve_root_git_project_for_trust(&proj).is_none());
-    assert!(resolve_root_git_project_for_trust(&proj.join("nested")).is_none());
+    assert!(resolve_root_git_project_for_trust(&proj).await.is_none());
+    assert!(
+        resolve_root_git_project_for_trust(&proj.join("nested"))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]

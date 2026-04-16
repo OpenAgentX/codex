@@ -54,20 +54,22 @@ impl SkillsWatcher {
         self.tx.subscribe()
     }
 
-    pub(crate) fn register_config(
+    pub(crate) async fn register_config(
         &self,
         config: &Config,
         skills_manager: &SkillsManager,
         plugins_manager: &PluginsManager,
+        fs: Option<Arc<dyn codex_exec_server::ExecutorFileSystem>>,
     ) -> WatchRegistration {
-        let plugin_outcome = plugins_manager.plugins_for_config(config);
+        let plugin_outcome = plugins_manager.plugins_for_config(config).await;
         let effective_skill_roots = plugin_outcome.effective_skill_roots();
         let skills_input = skills_load_input_from_config(config, effective_skill_roots);
         let roots = skills_manager
-            .skill_roots_for_config(&skills_input)
+            .skill_roots_for_config(&skills_input, fs)
+            .await
             .into_iter()
             .map(|root| WatchPath {
-                path: root.path,
+                path: root.path.into_path_buf(),
                 recursive: true,
             })
             .collect();
@@ -102,7 +104,7 @@ mod tests {
         let mut rx = skills_watcher.subscribe();
         let _registration = skills_watcher
             .subscriber
-            .register_path(PathBuf::from("/tmp/skill"), true);
+            .register_path(PathBuf::from("/tmp/skill"), /*recursive*/ true);
 
         file_watcher
             .send_paths_for_test(vec![PathBuf::from("/tmp/skill/SKILL.md")])

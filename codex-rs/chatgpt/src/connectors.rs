@@ -1,6 +1,7 @@
-use codex_core::AuthManager;
 use codex_core::config::Config;
-use codex_core::token_data::TokenData;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::token_data::TokenData;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -28,11 +29,14 @@ const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn apps_enabled(config: &Config) -> bool {
     let auth_manager = AuthManager::shared(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         config.cli_auth_credentials_store_mode,
     );
-    config.features.apps_enabled(Some(&auth_manager)).await
+    let auth = auth_manager.auth().await;
+    config
+        .features
+        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth))
 }
 pub async fn list_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
     if !apps_enabled(config).await {
@@ -69,10 +73,9 @@ pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>>
     }
     let token_data = get_chatgpt_token_data()?;
     let cache_key = all_connectors_cache_key(config, &token_data);
-    codex_connectors::cached_all_connectors(&cache_key).map(|connectors| {
-        let connectors = merge_plugin_apps(connectors, plugin_apps_for_config(config));
-        filter_disallowed_connectors(connectors)
-    })
+    let connectors = codex_connectors::cached_all_connectors(&cache_key)?;
+    let connectors = merge_plugin_apps(connectors, plugin_apps_for_config(config).await);
+    Some(filter_disallowed_connectors(connectors))
 }
 
 pub async fn list_all_connectors_with_options(
@@ -102,7 +105,7 @@ pub async fn list_all_connectors_with_options(
         },
     )
     .await?;
-    let connectors = merge_plugin_apps(connectors, plugin_apps_for_config(config));
+    let connectors = merge_plugin_apps(connectors, plugin_apps_for_config(config).await);
     Ok(filter_disallowed_connectors(connectors))
 }
 
@@ -115,9 +118,10 @@ fn all_connectors_cache_key(config: &Config, token_data: &TokenData) -> AllConne
     )
 }
 
-fn plugin_apps_for_config(config: &Config) -> Vec<codex_core::plugins::AppConnectorId> {
-    PluginsManager::new(config.codex_home.clone())
+async fn plugin_apps_for_config(config: &Config) -> Vec<codex_core::plugins::AppConnectorId> {
+    PluginsManager::new(config.codex_home.to_path_buf())
         .plugins_for_config(config)
+        .await
         .effective_apps()
 }
 
@@ -245,9 +249,9 @@ mod tests {
         let merged = merge_connectors_with_accessible(
             vec![app("alpha")],
             vec![app("alpha"), app("beta")],
-            true,
+            /*all_connectors_loaded*/ true,
         );
-        assert_eq!(merged, vec![merged_app("alpha", true)]);
+        assert_eq!(merged, vec![merged_app("alpha", /*is_accessible*/ true)]);
     }
 
     #[test]
@@ -255,11 +259,14 @@ mod tests {
         let merged = merge_connectors_with_accessible(
             vec![app("alpha")],
             vec![app("alpha"), app("beta")],
-            false,
+            /*all_connectors_loaded*/ false,
         );
         assert_eq!(
             merged,
-            vec![merged_app("alpha", true), merged_app("beta", true)]
+            vec![
+                merged_app("alpha", /*is_accessible*/ true),
+                merged_app("beta", /*is_accessible*/ true)
+            ]
         );
     }
 
@@ -272,7 +279,10 @@ mod tests {
                 AppConnectorId("gmail".to_string()),
             ],
         );
-        assert_eq!(connectors, vec![app("alpha"), merged_app("gmail", false)]);
+        assert_eq!(
+            connectors,
+            vec![app("alpha"), merged_app("gmail", /*is_accessible*/ false)]
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use crate::types::RateLimitStatusPayload;
 use crate::types::TurnAttemptsSiblingTurnsResponse;
 use anyhow::Result;
 use codex_client::build_reqwest_client_with_custom_ca;
-use codex_core::auth::CodexAuth;
-use codex_core::default_client::get_codex_user_agent;
+use codex_login::CodexAuth;
+use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -473,14 +473,22 @@ impl Client {
             crate::types::PlanType::Go => AccountPlanType::Go,
             crate::types::PlanType::Plus => AccountPlanType::Plus,
             crate::types::PlanType::Pro => AccountPlanType::Pro,
+            crate::types::PlanType::ProLite => AccountPlanType::ProLite,
             crate::types::PlanType::Team => AccountPlanType::Team,
+            crate::types::PlanType::SelfServeBusinessUsageBased => {
+                AccountPlanType::SelfServeBusinessUsageBased
+            }
             crate::types::PlanType::Business => AccountPlanType::Business,
+            crate::types::PlanType::EnterpriseCbpUsageBased => {
+                AccountPlanType::EnterpriseCbpUsageBased
+            }
             crate::types::PlanType::Enterprise => AccountPlanType::Enterprise,
             crate::types::PlanType::Edu | crate::types::PlanType::Education => AccountPlanType::Edu,
             crate::types::PlanType::Guest
             | crate::types::PlanType::FreeWorkspace
             | crate::types::PlanType::Quorum
-            | crate::types::PlanType::K12 => AccountPlanType::Unknown,
+            | crate::types::PlanType::K12
+            | crate::types::PlanType::Unknown => AccountPlanType::Unknown,
         }
     }
 
@@ -497,7 +505,20 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_backend_openapi_models::models::AdditionalRateLimitDetails;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn map_plan_type_supports_usage_based_business_variants() {
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::SelfServeBusinessUsageBased),
+            AccountPlanType::SelfServeBusinessUsageBased
+        );
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::EnterpriseCbpUsageBased),
+            AccountPlanType::EnterpriseCbpUsageBased
+        );
+    }
 
     #[test]
     fn usage_payload_maps_primary_and_additional_rate_limits() {
@@ -518,7 +539,7 @@ mod tests {
                 }))),
                 ..Default::default()
             }))),
-            additional_rate_limits: Some(Some(vec![crate::types::AdditionalRateLimitDetails {
+            additional_rate_limits: Some(Some(vec![AdditionalRateLimitDetails {
                 limit_name: "codex_other".to_string(),
                 metered_feature: "codex_other".to_string(),
                 rate_limit: Some(Some(Box::new(crate::types::RateLimitStatusDetails {
@@ -578,7 +599,7 @@ mod tests {
         let payload = RateLimitStatusPayload {
             plan_type: crate::types::PlanType::Plus,
             rate_limit: None,
-            additional_rate_limits: Some(Some(vec![crate::types::AdditionalRateLimitDetails {
+            additional_rate_limits: Some(Some(vec![AdditionalRateLimitDetails {
                 limit_name: "codex_other".to_string(),
                 metered_feature: "codex_other".to_string(),
                 rate_limit: None,

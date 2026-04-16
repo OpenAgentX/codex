@@ -1,7 +1,7 @@
 use codex_api::AuthProvider;
 use codex_api::ModelsClient;
-use codex_api::provider::Provider;
-use codex_api::provider::RetryConfig;
+use codex_api::Provider;
+use codex_api::RetryConfig;
 use codex_client::ReqwestTransport;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -24,9 +24,7 @@ use wiremock::matchers::path;
 struct DummyAuth;
 
 impl AuthProvider for DummyAuth {
-    fn bearer_token(&self) -> Option<String> {
-        None
-    }
+    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
 }
 
 fn provider(base_url: &str) -> Provider {
@@ -75,6 +73,7 @@ async fn models_client_hits_models_endpoint() {
             visibility: ModelVisibility::List,
             supported_in_api: true,
             priority: 1,
+            additional_speed_tiers: Vec::new(),
             upgrade: None,
             base_instructions: "base instructions".to_string(),
             model_messages: None,
@@ -85,7 +84,7 @@ async fn models_client_hits_models_endpoint() {
             availability_nux: None,
             apply_patch_tool_type: None,
             web_search_tool_type: Default::default(),
-            truncation_policy: TruncationPolicyConfig::bytes(10_000),
+            truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
             supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
             context_window: Some(272_000),

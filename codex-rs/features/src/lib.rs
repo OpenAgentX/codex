@@ -3,8 +3,6 @@
 //! This crate defines the feature registry plus the logic used to resolve an
 //! effective feature set from config-like inputs.
 
-use codex_login::AuthManager;
-use codex_login::CodexAuth;
 use codex_otel::SessionTelemetry;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -16,7 +14,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use toml::Table;
 
+mod feature_configs;
 mod legacy;
+pub use feature_configs::MultiAgentV2ConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
 
@@ -124,14 +124,16 @@ pub enum Feature {
     CodexGitCommit,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
+    /// Enable thread lifecycle analytics emitted via the app-server analytics pipeline.
+    GeneralAnalytics,
     /// Persist rollout metadata to a local SQLite database.
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
+    /// Enable the Telepathy sidecar for passive screen-context memories.
+    Telepathy,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
-    /// Allow the model to request `detail: "original"` image outputs on supported models.
-    ImageDetailOriginal,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
@@ -144,6 +146,8 @@ pub enum Feature {
     Apps,
     /// Enable the tool_search tool for apps.
     ToolSearch,
+    /// Expose placeholder tools for unavailable historical tool calls.
+    UnavailableDummyTools,
     /// Enable discoverable tool suggestions for apps.
     ToolSuggest,
     /// Enable plugins.
@@ -172,11 +176,14 @@ pub enum Feature {
     Artifact,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
-    /// Enable voice transcription in the TUI composer.
-    VoiceTranscription,
     /// Enable experimental realtime voice conversation mode in the TUI.
     RealtimeConversation,
-    /// Route interactive startup to the app-server-backed TUI implementation.
+    /// Connect app-server to the ChatGPT remote control service.
+    RemoteControl,
+    /// Removed compatibility flag retained as a no-op so old wrappers can
+    /// still pass `--enable image_detail_original`.
+    ImageDetailOriginal,
+    /// Removed compatibility flag. The TUI now always uses the app-server implementation.
     TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
@@ -184,6 +191,10 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
+    /// Use the agent identity registration flow for ChatGPT-authenticated sessions.
+    UseAgentIdentity,
+    /// Enable workspace dependency support.
+    WorkspaceDependencies,
 }
 
 impl Feature {
@@ -273,25 +284,8 @@ impl Features {
         self.enabled.contains(&f)
     }
 
-    pub async fn apps_enabled(&self, auth_manager: Option<&AuthManager>) -> bool {
-        if !self.enabled(Feature::Apps) {
-            return false;
-        }
-
-        let auth = match auth_manager {
-            Some(auth_manager) => auth_manager.auth().await,
-            None => None,
-        };
-        self.apps_enabled_for_auth(auth.as_ref())
-    }
-
-    pub fn apps_enabled_cached(&self, auth_manager: Option<&AuthManager>) -> bool {
-        let auth = auth_manager.and_then(AuthManager::auth_cached);
-        self.apps_enabled_for_auth(auth.as_ref())
-    }
-
-    pub fn apps_enabled_for_auth(&self, auth: Option<&CodexAuth>) -> bool {
-        self.enabled(Feature::Apps) && auth.is_some_and(CodexAuth::is_chatgpt_auth)
+    pub fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool {
+        self.enabled(Feature::Apps) && has_chatgpt_auth
     }
 
     pub fn use_legacy_landlock(&self) -> bool {
@@ -371,10 +365,19 @@ impl Features {
                         Feature::WebSearchCached,
                     );
                 }
+                "tui_app_server" => {
+                    continue;
+                }
+                "image_detail_original" => {
+                    continue;
+                }
                 _ => {}
             }
             match feature_for_key(k) {
                 Some(feat) => {
+                    if matches!(feat, Feature::TuiAppServer) {
+                        continue;
+                    }
                     if k != feat.key() {
                         self.record_legacy_usage(k.as_str(), feat);
                     }
@@ -407,7 +410,7 @@ impl Features {
             .apply(&mut features);
 
             if let Some(feature_entries) = source.features {
-                features.apply_map(&feature_entries.entries);
+                features.apply_toml(feature_entries);
             }
         }
 
@@ -501,8 +504,61 @@ pub fn is_known_feature_key(key: &str) -> bool {
 /// Deserializable features table for TOML.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 pub struct FeaturesToml {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
+    /// Boolean feature toggles keyed by canonical or legacy feature name.
     #[serde(flatten)]
-    pub entries: BTreeMap<String, bool>,
+    entries: BTreeMap<String, bool>,
+}
+
+impl Features {
+    fn apply_toml(&mut self, features: &FeaturesToml) {
+        let entries = features.entries();
+        self.apply_map(&entries);
+    }
+}
+
+impl FeaturesToml {
+    pub fn entries(&self) -> BTreeMap<String, bool> {
+        let mut entries = self.entries.clone();
+        if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
+        }
+        entries
+    }
+}
+
+impl From<BTreeMap<String, bool>> for FeaturesToml {
+    fn from(entries: BTreeMap<String, bool>) -> Self {
+        Self {
+            entries,
+            ..Default::default()
+        }
+    }
+}
+
+// To be used for features that need more configuration than just enabled/disabled and
+// require a custom config struct under `[features]`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum FeatureToml<T> {
+    Enabled(bool),
+    Config(T),
+}
+
+impl<T: FeatureConfig> FeatureToml<T> {
+    pub fn enabled(&self) -> Option<bool> {
+        match self {
+            Self::Enabled(enabled) => Some(*enabled),
+            Self::Config(config) => config.enabled(),
+        }
+    }
+}
+
+// A trait to be implemented by custom feature config structs when defining a feature that needs more configuration than
+// just enabled/disabled.
+pub trait FeatureConfig {
+    fn enabled(&self) -> Option<bool>;
 }
 
 /// Single, easy-to-read registry of all feature definitions.
@@ -606,6 +662,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::GeneralAnalytics,
+        key: "general_analytics",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
         stage: Stage::Removed,
@@ -614,18 +676,22 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MemoryTool,
         key: "memories",
+        stage: Stage::Experimental {
+            name: "Memories",
+            menu_description: "Allow Codex to create new memories from conversations and bring relevant memories into new conversations.",
+            announcement: "NEW: Codex can now generate and uses memories. Try is now with `/memories`",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Telepathy,
+        key: "telepathy",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ChildAgentsMd,
         key: "child_agents_md",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ImageDetailOriginal,
-        key: "image_detail_original",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -726,6 +792,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::UnavailableDummyTools,
+        key: "unavailable_dummy_tools",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ToolSuggest,
         key: "tool_suggest",
         stage: Stage::Stable,
@@ -808,26 +880,28 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::VoiceTranscription,
-        key: "voice_transcription",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::RealtimeConversation,
         key: "realtime_conversation",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::RemoteControl,
+        key: "remote_control",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ImageDetailOriginal,
+        key: "image_detail_original",
+        stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::TuiAppServer,
         key: "tui_app_server",
-        stage: Stage::Experimental {
-            name: "App-server TUI",
-            menu_description: "Use the app-server-backed TUI implementation.",
-            announcement: "",
-        },
-        default_enabled: false,
+        stage: Stage::Removed,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::PreventIdleSleep,
@@ -858,6 +932,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "responses_websockets_v2",
         stage: Stage::Removed,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UseAgentIdentity,
+        key: "use_agent_identity",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WorkspaceDependencies,
+        key: "workspace_dependencies",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
 ];
 
