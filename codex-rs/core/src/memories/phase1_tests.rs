@@ -3,6 +3,8 @@ use super::JobResult;
 use super::aggregate_stats;
 use super::job::serialize_filtered_rollout_response_items;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
@@ -22,7 +24,6 @@ fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
                 text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>".to_string(),
             },
         ],
-        end_turn: None,
         phase: None,
     };
     let skill_message = ResponseItem::Message {
@@ -32,7 +33,6 @@ fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
             text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
                 .to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     let subagent_message = ResponseItem::Message {
@@ -42,7 +42,6 @@ fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
             text: "<subagent_notification>{\"agent_id\":\"a\",\"status\":\"completed\"}</subagent_notification>"
                 .to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
 
@@ -64,12 +63,30 @@ fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
                     text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>"
                         .to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             subagent_message,
         ]
     );
+}
+
+#[test]
+fn serializes_memory_rollout_redacts_secrets_before_prompt_upload() {
+    let serialized = serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            call_id: "call_123".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(
+                    r#"{"token":"sk-abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),
+                ),
+                success: Some(true),
+            },
+        },
+    )])
+    .expect("serialize");
+
+    assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(serialized.contains("[REDACTED_SECRET]"));
 }
 
 #[test]

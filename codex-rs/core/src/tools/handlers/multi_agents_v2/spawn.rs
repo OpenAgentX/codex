@@ -5,13 +5,13 @@ use crate::agent::control::render_input_preview;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::session::turn_context::TurnEnvironment;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 
 pub(crate) struct Handler;
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = SpawnAgentResult;
 
@@ -40,7 +40,7 @@ impl ToolHandler for Handler {
             .map(str::trim)
             .filter(|role| !role.is_empty());
 
-        let initial_operation = parse_collab_input(/*message*/ None, Some(args.items))?;
+        let initial_operation = parse_collab_input(Some(args.message), /*items*/ None)?;
         let prompt = render_input_preview(&initial_operation);
 
         let session_source = turn.session_source.clone();
@@ -66,17 +66,25 @@ impl ToolHandler for Handler {
             .await;
         let mut config =
             build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort,
-        )
-        .await?;
-        apply_role_to_config(&mut config, role_name)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
+            reject_full_fork_spawn_overrides(
+                role_name,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )?;
+        } else {
+            apply_requested_spawn_agent_model_overrides(
+                &session,
+                turn.as_ref(),
+                &mut config,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )
+            .await?;
+            apply_role_to_config(&mut config, role_name)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
 
@@ -116,6 +124,12 @@ impl ToolHandler for Handler {
                 SpawnAgentOptions {
                     fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
                     fork_mode,
+                    environments: Some(
+                        turn.environments
+                            .iter()
+                            .map(TurnEnvironment::selection)
+                            .collect(),
+                    ),
                 },
             )
             .await
@@ -191,18 +205,22 @@ impl ToolHandler for Handler {
             )
         })?;
 
-        Ok(SpawnAgentResult {
-            agent_id: None,
-            task_name,
-            nickname,
-        })
+        let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
+        if hide_agent_metadata {
+            Ok(SpawnAgentResult::HiddenMetadata { task_name })
+        } else {
+            Ok(SpawnAgentResult::WithNickname {
+                task_name,
+                nickname,
+            })
+        }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
-    items: Vec<UserInput>,
+    message: String,
     task_name: String,
     agent_type: Option<String>,
     model: Option<String>,
@@ -219,14 +237,12 @@ impl SpawnAgentArgs {
             ));
         }
 
-        let Some(fork_turns) = self
+        let fork_turns = self
             .fork_turns
             .as_deref()
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty())
-        else {
-            return Ok(None);
-        };
+            .unwrap_or("all");
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
@@ -251,10 +267,15 @@ impl SpawnAgentArgs {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct SpawnAgentResult {
-    agent_id: Option<String>,
-    task_name: String,
-    nickname: Option<String>,
+#[serde(untagged)]
+pub(crate) enum SpawnAgentResult {
+    WithNickname {
+        task_name: String,
+        nickname: Option<String>,
+    },
+    HiddenMetadata {
+        task_name: String,
+    },
 }
 
 impl ToolOutput for SpawnAgentResult {

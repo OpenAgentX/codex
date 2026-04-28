@@ -12,15 +12,27 @@ pub(super) use crate::app_event::RealtimeAudioDeviceKind;
 pub(super) use crate::app_event_sender::AppEventSender;
 pub(super) use crate::bottom_pane::LocalImageAttachment;
 pub(super) use crate::bottom_pane::MentionBinding;
+pub(super) use crate::bottom_pane::QueuedInputAction;
 pub(super) use crate::chatwidget::realtime::RealtimeConversationPhase;
 pub(super) use crate::history_cell::UserHistoryCell;
+pub(super) use crate::legacy_core::config::Config;
+pub(super) use crate::legacy_core::config::ConfigBuilder;
+pub(super) use crate::legacy_core::config::Constrained;
+pub(super) use crate::legacy_core::config::ConstraintError;
 pub(super) use crate::model_catalog::ModelCatalog;
 pub(super) use crate::test_backend::VT100Backend;
 pub(super) use crate::test_support::PathBufExt;
+pub(super) use crate::test_support::test_path_buf;
 pub(super) use crate::test_support::test_path_display;
 pub(super) use crate::tui::FrameRequester;
 pub(super) use assert_matches::assert_matches;
+pub(super) use codex_app_server_protocol::AddCreditsNudgeCreditType;
+pub(super) use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+pub(super) use codex_app_server_protocol::AdditionalFileSystemPermissions as AppServerAdditionalFileSystemPermissions;
+pub(super) use codex_app_server_protocol::AdditionalNetworkPermissions as AppServerAdditionalNetworkPermissions;
+pub(super) use codex_app_server_protocol::AdditionalPermissionProfile as AppServerAdditionalPermissionProfile;
 pub(super) use codex_app_server_protocol::AppSummary;
+pub(super) use codex_app_server_protocol::AutoReviewDecisionSource as AppServerGuardianApprovalReviewDecisionSource;
 pub(super) use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
 pub(super) use codex_app_server_protocol::CollabAgentStatus as AppServerCollabAgentStatus;
 pub(super) use codex_app_server_protocol::CollabAgentTool as AppServerCollabAgentTool;
@@ -29,11 +41,16 @@ pub(super) use codex_app_server_protocol::CommandAction as AppServerCommandActio
 pub(super) use codex_app_server_protocol::CommandExecutionRequestApprovalParams as AppServerCommandExecutionRequestApprovalParams;
 pub(super) use codex_app_server_protocol::CommandExecutionSource as AppServerCommandExecutionSource;
 pub(super) use codex_app_server_protocol::CommandExecutionStatus as AppServerCommandExecutionStatus;
+pub(super) use codex_app_server_protocol::ConfigWarningNotification;
 pub(super) use codex_app_server_protocol::ErrorNotification;
 pub(super) use codex_app_server_protocol::FileUpdateChange;
 pub(super) use codex_app_server_protocol::GuardianApprovalReview;
+pub(super) use codex_app_server_protocol::GuardianApprovalReviewAction as AppServerGuardianApprovalReviewAction;
 pub(super) use codex_app_server_protocol::GuardianApprovalReviewStatus;
+pub(super) use codex_app_server_protocol::GuardianCommandSource as AppServerGuardianCommandSource;
 pub(super) use codex_app_server_protocol::GuardianRiskLevel as AppServerGuardianRiskLevel;
+pub(super) use codex_app_server_protocol::GuardianUserAuthorization as AppServerGuardianUserAuthorization;
+pub(super) use codex_app_server_protocol::GuardianWarningNotification;
 pub(super) use codex_app_server_protocol::HookCompletedNotification as AppServerHookCompletedNotification;
 pub(super) use codex_app_server_protocol::HookEventName as AppServerHookEventName;
 pub(super) use codex_app_server_protocol::HookExecutionMode as AppServerHookExecutionMode;
@@ -50,9 +67,13 @@ pub(super) use codex_app_server_protocol::ItemGuardianApprovalReviewStartedNotif
 pub(super) use codex_app_server_protocol::ItemStartedNotification;
 pub(super) use codex_app_server_protocol::MarketplaceInterface;
 pub(super) use codex_app_server_protocol::McpServerStartupState;
+pub(super) use codex_app_server_protocol::McpServerStatusDetail;
 pub(super) use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+pub(super) use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
+pub(super) use codex_app_server_protocol::ModelVerificationNotification;
 pub(super) use codex_app_server_protocol::PatchApplyStatus as AppServerPatchApplyStatus;
 pub(super) use codex_app_server_protocol::PatchChangeKind;
+pub(super) use codex_app_server_protocol::PermissionsRequestApprovalParams as AppServerPermissionsRequestApprovalParams;
 pub(super) use codex_app_server_protocol::PluginAuthPolicy;
 pub(super) use codex_app_server_protocol::PluginDetail;
 pub(super) use codex_app_server_protocol::PluginInstallPolicy;
@@ -73,26 +94,23 @@ pub(super) use codex_app_server_protocol::TurnError as AppServerTurnError;
 pub(super) use codex_app_server_protocol::TurnStartedNotification;
 pub(super) use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 pub(super) use codex_app_server_protocol::UserInput as AppServerUserInput;
-pub(super) use codex_core::config::ApprovalsReviewer;
-pub(super) use codex_core::config::Config;
-pub(super) use codex_core::config::ConfigBuilder;
-pub(super) use codex_core::config::Constrained;
-pub(super) use codex_core::config::ConstraintError;
-pub(super) use codex_core::config::types::Notifications;
+pub(super) use codex_app_server_protocol::WarningNotification;
+pub(super) use codex_config::AppRequirementToml;
+pub(super) use codex_config::AppsRequirementsToml;
+pub(super) use codex_config::ConfigLayerStack;
+pub(super) use codex_config::ConfigRequirements;
+pub(super) use codex_config::ConfigRequirementsToml;
+pub(super) use codex_config::RequirementSource;
+pub(super) use codex_config::types::ApprovalsReviewer;
+pub(super) use codex_config::types::Notifications;
 #[cfg(target_os = "windows")]
-pub(super) use codex_core::config::types::WindowsSandboxModeToml;
-pub(super) use codex_core::config_loader::AppRequirementToml;
-pub(super) use codex_core::config_loader::AppsRequirementsToml;
-pub(super) use codex_core::config_loader::ConfigLayerStack;
-pub(super) use codex_core::config_loader::ConfigRequirements;
-pub(super) use codex_core::config_loader::ConfigRequirementsToml;
-pub(super) use codex_core::config_loader::RequirementSource;
-pub(super) use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
-pub(super) use codex_core::plugins::OPENAI_CURATED_MARKETPLACE_NAME;
-pub(super) use codex_core::skills::model::SkillMetadata;
+pub(super) use codex_config::types::WindowsSandboxModeToml;
+pub(super) use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
+pub(super) use codex_core_skills::model::SkillMetadata;
 pub(super) use codex_features::FEATURES;
 pub(super) use codex_features::Feature;
 pub(super) use codex_git_utils::CommitLogEntry;
+pub(super) use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 pub(super) use codex_otel::RuntimeMetricsSummary;
 pub(super) use codex_otel::SessionTelemetry;
 pub(super) use codex_protocol::ThreadId;
@@ -107,8 +125,13 @@ pub(super) use codex_protocol::items::AgentMessageItem;
 pub(super) use codex_protocol::items::PlanItem;
 pub(super) use codex_protocol::items::TurnItem;
 pub(super) use codex_protocol::items::UserMessageItem;
+pub(super) use codex_protocol::models::FileSystemPermissions;
 pub(super) use codex_protocol::models::MessagePhase;
+pub(super) use codex_protocol::models::NetworkPermissions;
+pub(super) use codex_protocol::models::PermissionProfile;
+pub(super) use codex_protocol::openai_models::ModelInfo;
 pub(super) use codex_protocol::openai_models::ModelPreset;
+pub(super) use codex_protocol::openai_models::ModelsResponse;
 pub(super) use codex_protocol::openai_models::ReasoningEffortPreset;
 pub(super) use codex_protocol::openai_models::default_input_modalities;
 pub(super) use codex_protocol::parse_command::ParsedCommand;
@@ -126,6 +149,7 @@ pub(super) use codex_protocol::protocol::CodexErrorInfo;
 pub(super) use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 pub(super) use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 pub(super) use codex_protocol::protocol::CreditsSnapshot;
+pub(super) use codex_protocol::protocol::ErrorEvent;
 pub(super) use codex_protocol::protocol::Event;
 pub(super) use codex_protocol::protocol::EventMsg;
 pub(super) use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -136,21 +160,28 @@ pub(super) use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandSta
 pub(super) use codex_protocol::protocol::ExecPolicyAmendment;
 pub(super) use codex_protocol::protocol::ExitedReviewModeEvent;
 pub(super) use codex_protocol::protocol::FileChange;
+pub(super) use codex_protocol::protocol::GuardianAssessmentAction;
+pub(super) use codex_protocol::protocol::GuardianAssessmentDecisionSource;
 pub(super) use codex_protocol::protocol::GuardianAssessmentEvent;
 pub(super) use codex_protocol::protocol::GuardianAssessmentStatus;
+pub(super) use codex_protocol::protocol::GuardianCommandSource;
 pub(super) use codex_protocol::protocol::GuardianRiskLevel;
+pub(super) use codex_protocol::protocol::GuardianUserAuthorization;
 pub(super) use codex_protocol::protocol::ImageGenerationEndEvent;
 pub(super) use codex_protocol::protocol::ItemCompletedEvent;
 pub(super) use codex_protocol::protocol::McpStartupCompleteEvent;
 pub(super) use codex_protocol::protocol::McpStartupStatus;
 pub(super) use codex_protocol::protocol::McpStartupUpdateEvent;
+pub(super) use codex_protocol::protocol::ModelVerification as CoreModelVerification;
+pub(super) use codex_protocol::protocol::ModelVerificationEvent;
 pub(super) use codex_protocol::protocol::NonSteerableTurnKind;
 pub(super) use codex_protocol::protocol::Op;
 pub(super) use codex_protocol::protocol::PatchApplyBeginEvent;
 pub(super) use codex_protocol::protocol::PatchApplyEndEvent;
 pub(super) use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
+pub(super) use codex_protocol::protocol::RateLimitReachedType;
+pub(super) use codex_protocol::protocol::RateLimitSnapshot;
 pub(super) use codex_protocol::protocol::RateLimitWindow;
-pub(super) use codex_protocol::protocol::ReadOnlyAccess;
 pub(super) use codex_protocol::protocol::RealtimeConversationClosedEvent;
 pub(super) use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
 pub(super) use codex_protocol::protocol::RealtimeEvent;
@@ -171,6 +202,7 @@ pub(super) use codex_protocol::protocol::UndoCompletedEvent;
 pub(super) use codex_protocol::protocol::UndoStartedEvent;
 pub(super) use codex_protocol::protocol::ViewImageToolCallEvent;
 pub(super) use codex_protocol::protocol::WarningEvent;
+pub(super) use codex_protocol::request_permissions::RequestPermissionProfile;
 pub(super) use codex_protocol::request_user_input::RequestUserInputEvent;
 pub(super) use codex_protocol::request_user_input::RequestUserInputQuestion;
 pub(super) use codex_protocol::request_user_input::RequestUserInputQuestionOption;
@@ -184,6 +216,8 @@ pub(super) use codex_utils_approval_presets::builtin_approval_presets;
 pub(super) use crossterm::event::KeyCode;
 pub(super) use crossterm::event::KeyEvent;
 pub(super) use crossterm::event::KeyModifiers;
+pub(super) use insta::assert_snapshot;
+pub(super) use serde_json::json;
 #[cfg(target_os = "windows")]
 pub(super) use serial_test::serial;
 pub(super) use std::collections::BTreeMap;
@@ -197,7 +231,14 @@ pub(super) use tokio::sync::mpsc::unbounded_channel;
 pub(super) use toml::Value as TomlValue;
 
 pub(super) fn chatwidget_snapshot_dir() -> PathBuf {
-    codex_utils_cargo_bin::find_resource!("src/chatwidget/snapshots").expect("snapshot dir")
+    let snapshot_file = codex_utils_cargo_bin::find_resource!(
+        "src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap"
+    )
+    .expect("snapshot file");
+    snapshot_file
+        .parent()
+        .unwrap_or_else(|| panic!("snapshot file has no parent: {}", snapshot_file.display()))
+        .to_path_buf()
 }
 
 macro_rules! assert_chatwidget_snapshot {
@@ -224,19 +265,27 @@ macro_rules! assert_chatwidget_snapshot {
 }
 
 mod app_server;
+mod approval_requests;
+mod background_events;
 mod composer_submission;
 mod exec_flow;
+mod goal_menu;
+mod guardian;
 mod helpers;
 mod history_replay;
-mod mcp_guardian;
+mod mcp_startup;
 mod permissions;
 mod plan_mode;
 mod popups_and_settings;
 mod review_mode;
+mod side;
 mod slash_commands;
 mod status_and_layout;
 mod status_command_tests;
+mod status_surface_previews;
+mod terminal_title;
 
 pub(crate) use helpers::make_chatwidget_manual_with_sender;
 pub(crate) use helpers::set_chatgpt_auth;
+pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;

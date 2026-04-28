@@ -22,6 +22,7 @@ use tracing::Span;
 use tracing::warn;
 
 use crate::error_code::INTERNAL_ERROR_CODE;
+use crate::error_code::internal_error;
 use crate::server_request_error::TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON;
 
 #[cfg(test)]
@@ -196,7 +197,7 @@ impl ThreadScopedOutgoingMessageSender {
     pub(crate) async fn send_error(
         &self,
         request_id: ConnectionRequestId,
-        error: JSONRPCErrorError,
+        error: impl Into<JSONRPCErrorError>,
     ) {
         self.outgoing.send_error(request_id, error).await;
     }
@@ -493,11 +494,7 @@ impl OutgoingMessageSender {
                 self.send_error_inner(
                     request_context,
                     request_id,
-                    JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("failed to serialize response: {err}"),
-                        data: None,
-                    },
+                    internal_error(format!("failed to serialize response: {err}")),
                 )
                 .await;
             }
@@ -571,11 +568,25 @@ impl OutgoingMessageSender {
     pub(crate) async fn send_error(
         &self,
         request_id: ConnectionRequestId,
-        error: JSONRPCErrorError,
+        error: impl Into<JSONRPCErrorError>,
     ) {
         let request_context = self.take_request_context(&request_id).await;
-        self.send_error_inner(request_context, request_id, error)
+        self.send_error_inner(request_context, request_id, error.into())
             .await;
+    }
+
+    pub(crate) async fn send_result<T, E>(
+        &self,
+        request_id: ConnectionRequestId,
+        result: std::result::Result<T, E>,
+    ) where
+        T: Serialize,
+        E: Into<JSONRPCErrorError>,
+    {
+        match result {
+            Ok(response) => self.send_response(request_id, response).await,
+            Err(error) => self.send_error(request_id, error).await,
+        }
     }
 
     async fn send_error_inner(
@@ -657,8 +668,11 @@ mod tests {
     use codex_app_server_protocol::ConfigWarningNotification;
     use codex_app_server_protocol::DynamicToolCallParams;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
+    use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::ModelRerouteReason;
     use codex_app_server_protocol::ModelReroutedNotification;
+    use codex_app_server_protocol::ModelVerification;
+    use codex_app_server_protocol::ModelVerificationNotification;
     use codex_app_server_protocol::RateLimitSnapshot;
     use codex_app_server_protocol::RateLimitWindow;
     use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -736,6 +750,7 @@ mod tests {
                     secondary: None,
                     credits: None,
                     plan_type: Some(PlanType::Plus),
+                    rate_limit_reached_type: None,
                 },
             });
 
@@ -754,7 +769,8 @@ mod tests {
                         },
                         "secondary": null,
                         "credits": null,
-                        "planType": "plus"
+                        "planType": "plus",
+                        "rateLimitReachedType": null
                     }
                 },
             }),
@@ -811,6 +827,28 @@ mod tests {
     }
 
     #[test]
+    fn verify_guardian_warning_notification_serialization() {
+        let notification = ServerNotification::GuardianWarning(GuardianWarningNotification {
+            thread_id: "thread-1".to_string(),
+            message: "Automatic approval review denied the requested action.".to_string(),
+        });
+
+        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        assert_eq!(
+            json!({
+                "method": "guardianWarning",
+                "params": {
+                    "threadId": "thread-1",
+                    "message": "Automatic approval review denied the requested action.",
+                },
+            }),
+            serde_json::to_value(jsonrpc_notification)
+                .expect("ensure the notification serializes correctly"),
+            "ensure the notification serializes correctly"
+        );
+    }
+
+    #[test]
     fn verify_model_rerouted_notification_serialization() {
         let notification = ServerNotification::ModelRerouted(ModelReroutedNotification {
             thread_id: "thread-1".to_string(),
@@ -830,6 +868,30 @@ mod tests {
                     "fromModel": "gpt-5.3-codex",
                     "toModel": "gpt-5.2",
                     "reason": "highRiskCyberActivity",
+                },
+            }),
+            serde_json::to_value(jsonrpc_notification)
+                .expect("ensure the notification serializes correctly"),
+            "ensure the notification serializes correctly"
+        );
+    }
+
+    #[test]
+    fn verify_model_verification_notification_serialization() {
+        let notification = ServerNotification::ModelVerification(ModelVerificationNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            verifications: vec![ModelVerification::TrustedAccessForCyber],
+        });
+
+        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        assert_eq!(
+            json!({
+                "method": "model/verification",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "verifications": ["trustedAccessForCyber"],
                 },
             }),
             serde_json::to_value(jsonrpc_notification)
@@ -1065,6 +1127,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),
+                    namespace: None,
                     tool: "tool".to_string(),
                     arguments: json!({}),
                 },
@@ -1122,6 +1185,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
                     call_id: "call-0".to_string(),
+                    namespace: None,
                     tool: "tool".to_string(),
                     arguments: json!({}),
                 },

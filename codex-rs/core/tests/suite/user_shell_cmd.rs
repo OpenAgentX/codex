@@ -1,5 +1,6 @@
 use anyhow::Context;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -141,7 +142,7 @@ async fn user_shell_cmd_can_be_interrupted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let fixture = builder.build(&server).await?;
 
     let call_id = "active-turn-shell-call";
@@ -170,6 +171,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
     fixture
         .codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "run model shell command".to_string(),
                 text_elements: Vec::new(),
@@ -179,6 +181,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: fixture.session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -336,7 +339,12 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
 async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let mut builder = core_test_support::test_codex::test_codex().with_config(|config| {
-        config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Restricted;
+        let file_system_sandbox_policy = config.permissions.file_system_sandbox_policy();
+        config.permissions.permission_profile =
+            codex_config::Constrained::allow_any(PermissionProfile::from_runtime_permissions(
+                &file_system_sandbox_policy,
+                NetworkSandboxPolicy::Restricted,
+            ));
     });
     let test = builder.build(&server).await?;
 
@@ -350,13 +358,22 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
         .submit(Op::RunUserShellCommand { command })
         .await?;
 
-    let end_event = wait_for_event_match(&test.codex, |ev| match ev {
+    let ExecCommandEndEvent {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    } = wait_for_event_match(&test.codex, |ev| match ev {
         EventMsg::ExecCommandEnd(event) => Some(event.clone()),
         _ => None,
     })
     .await;
-    assert_eq!(end_event.exit_code, 0);
-    assert_eq!(end_event.stdout.trim(), "not-set");
+
+    assert_eq!(
+        exit_code, 0,
+        "shell command should execute successfully. stdout=`{stdout}`, stderr=`{stderr}`",
+    );
+    assert_eq!(stdout.trim(), "not-set");
 
     Ok(())
 }
@@ -430,11 +447,9 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex()
-        .with_model("gpt-5.1-codex")
-        .with_config(|config| {
-            config.tool_output_token_limit = Some(100);
-        });
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.tool_output_token_limit = Some(100);
+    });
     let fixture = builder.build(&server).await?;
 
     let call_id = "user-shell-double-truncation";

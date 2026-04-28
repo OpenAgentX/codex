@@ -416,12 +416,24 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
-        self.backend
-            .set_cursor_position(self.viewport_area.as_position())?;
+        self.clear_after_position(self.viewport_area.as_position())
+    }
+
+    /// Clear from `position` through the end of the visible screen and force a full redraw.
+    pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
+        self.backend.set_cursor_position(position)?;
         self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
         Ok(())
+    }
+
+    /// Force the next draw pass to repaint the entire viewport by resetting the
+    /// diff buffer. Call this after operations that move screen content outside of
+    /// ratatui's knowledge (e.g., Zellij-mode scrolling via raw newlines), since
+    /// the diff buffer's assumptions about what is currently displayed are invalid.
+    pub fn invalidate_viewport(&mut self) {
+        self.previous_buffer_mut().reset();
     }
 
     /// Clear terminal scrollback (if supported) and force a full redraw.

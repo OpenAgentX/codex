@@ -5,10 +5,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigLayerStackOrdering;
-use crate::is_dangerous_command::command_might_be_dangerous;
-use crate::is_safe_command::is_known_safe_command;
+use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
 use codex_execpolicy::AmendError;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Error as ExecPolicyRuleError;
@@ -21,20 +20,23 @@ use codex_execpolicy::RuleMatch;
 use codex_execpolicy::blocking_append_allow_prefix_rule;
 use codex_execpolicy::blocking_append_network_rule;
 use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
+use codex_shell_command::is_safe_command::is_known_safe_command;
 use thiserror::Error;
 use tokio::fs;
+use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
 use tracing::instrument;
 
-use crate::bash::parse_shell_lc_plain_commands;
-use crate::bash::parse_shell_lc_single_command_prefix;
 use crate::config::Config;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::sandboxing::ExecApprovalRequirement;
+use codex_shell_command::bash::parse_shell_lc_plain_commands;
+use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use shlex::try_join as shlex_try_join;
 
@@ -110,6 +112,12 @@ pub(crate) fn child_uses_parent_exec_policy(parent_config: &Config, child_config
     }
 
     exec_policy_config_folders(parent_config) == exec_policy_config_folders(child_config)
+        && parent_config
+            .config_layer_stack
+            .ignore_user_and_project_exec_policy_rules()
+            == child_config
+                .config_layer_stack
+                .ignore_user_and_project_exec_policy_rules()
         && parent_config.config_layer_stack.requirements().exec_policy
             == child_config.config_layer_stack.requirements().exec_policy
 }
@@ -190,14 +198,15 @@ pub enum ExecPolicyUpdateError {
 
 pub(crate) struct ExecPolicyManager {
     policy: ArcSwap<Policy>,
-    update_lock: tokio::sync::Mutex<()>,
+    update_lock: Semaphore,
 }
 
 pub(crate) struct ExecApprovalRequest<'a> {
     pub(crate) command: &'a [String],
     pub(crate) approval_policy: AskForApproval,
-    pub(crate) sandbox_policy: &'a SandboxPolicy,
+    pub(crate) permission_profile: PermissionProfile,
     pub(crate) file_system_sandbox_policy: &'a FileSystemSandboxPolicy,
+    pub(crate) sandbox_cwd: &'a Path,
     pub(crate) sandbox_permissions: SandboxPermissions,
     pub(crate) prefix_rule: Option<Vec<String>>,
 }
@@ -206,7 +215,7 @@ impl ExecPolicyManager {
     pub(crate) fn new(policy: Arc<Policy>) -> Self {
         Self {
             policy: ArcSwap::from(policy),
-            update_lock: tokio::sync::Mutex::new(()),
+            update_lock: Semaphore::new(/*permits*/ 1),
         }
     }
 
@@ -230,8 +239,9 @@ impl ExecPolicyManager {
         let ExecApprovalRequest {
             command,
             approval_policy,
-            sandbox_policy,
+            permission_profile,
             file_system_sandbox_policy,
+            sandbox_cwd,
             sandbox_permissions,
             prefix_rule,
         } = req;
@@ -244,8 +254,9 @@ impl ExecPolicyManager {
         let exec_policy_fallback = |cmd: &[String]| {
             render_decision_for_unmatched_command(
                 approval_policy,
-                sandbox_policy,
+                &permission_profile,
                 file_system_sandbox_policy,
+                sandbox_cwd,
                 cmd,
                 sandbox_permissions,
                 used_complex_parsing,
@@ -296,9 +307,19 @@ impl ExecPolicyManager {
                 }
             }
             Decision::Allow => ExecApprovalRequirement::Skip {
-                // Bypass sandbox if execpolicy allows the command
-                bypass_sandbox: evaluation.matched_rules.iter().any(|rule_match| {
-                    is_policy_match(rule_match) && rule_match.decision() == Decision::Allow
+                // Bypass sandbox only when every parsed command segment is
+                // explicitly allowed by execpolicy.
+                bypass_sandbox: commands.iter().all(|command| {
+                    exec_policy
+                        .matches_for_command_with_options(
+                            command,
+                            /*heuristics_fallback*/ None,
+                            &match_options,
+                        )
+                        .iter()
+                        .any(|rule_match| {
+                            is_policy_match(rule_match) && rule_match.decision() == Decision::Allow
+                        })
                 }),
                 proposed_execpolicy_amendment: if auto_amendment_allowed {
                     try_derive_execpolicy_amendment_for_allow_rules(&evaluation.matched_rules)
@@ -314,7 +335,15 @@ impl ExecPolicyManager {
         codex_home: &Path,
         amendment: &ExecPolicyAmendment,
     ) -> Result<(), ExecPolicyUpdateError> {
-        let _update_guard = self.update_lock.lock().await;
+        let _update_guard =
+            self.update_lock
+                .acquire()
+                .await
+                .map_err(|_| ExecPolicyUpdateError::AddRule {
+                    source: ExecPolicyRuleError::InvalidRule(
+                        "exec policy update semaphore closed".to_string(),
+                    ),
+                })?;
         let policy_path = default_policy_path(codex_home);
         spawn_blocking({
             let policy_path = policy_path.clone();
@@ -359,7 +388,15 @@ impl ExecPolicyManager {
         decision: Decision,
         justification: Option<String>,
     ) -> Result<(), ExecPolicyUpdateError> {
-        let _update_guard = self.update_lock.lock().await;
+        let _update_guard =
+            self.update_lock
+                .acquire()
+                .await
+                .map_err(|_| ExecPolicyUpdateError::AddRule {
+                    source: ExecPolicyRuleError::InvalidRule(
+                        "exec policy update semaphore closed".to_string(),
+                    ),
+                })?;
         let policy_path = default_policy_path(codex_home);
         let host = host.to_string();
         spawn_blocking({
@@ -485,6 +522,8 @@ async fn load_exec_policy_with_warning(
 }
 
 pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy, ExecPolicyError> {
+    // Disabled project layers already represent the trust decision, so hooks
+    // and exec-policy loading can reuse the normal trusted-layer view.
     // Iterate the layers in increasing order of precedence, adding the *.rules
     // from each layer, so that higher-precedence layers can override
     // rules defined in lower-precedence ones.
@@ -493,9 +532,16 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ false,
     ) {
+        if config_stack.ignore_user_and_project_exec_policy_rules()
+            && matches!(
+                layer.name,
+                ConfigLayerSource::User { .. } | ConfigLayerSource::Project { .. }
+            )
+        {
+            continue;
+        }
         if let Some(config_folder) = layer.config_folder() {
-            #[expect(clippy::expect_used)]
-            let policy_dir = config_folder.join(RULES_DIR_NAME).expect("safe join");
+            let policy_dir = config_folder.join(RULES_DIR_NAME);
             let layer_policy_paths = collect_policy_files(&policy_dir).await?;
             policy_paths.extend(layer_policy_paths);
         }
@@ -537,8 +583,9 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
 /// If a command is not matched by any execpolicy rule, derive a [`Decision`].
 pub fn render_decision_for_unmatched_command(
     approval_policy: AskForApproval,
-    sandbox_policy: &SandboxPolicy,
+    permission_profile: &PermissionProfile,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    sandbox_cwd: &Path,
     command: &[String],
     sandbox_permissions: SandboxPermissions,
     used_complex_parsing: bool,
@@ -549,8 +596,12 @@ pub fn render_decision_for_unmatched_command(
 
     // On Windows, ReadOnly sandbox is not a real sandbox, so special-case it
     // here.
-    let environment_lacks_sandbox_protections =
-        cfg!(windows) && matches!(sandbox_policy, SandboxPolicy::ReadOnly { .. });
+    let environment_lacks_sandbox_protections = cfg!(windows)
+        && profile_is_managed_read_only(
+            permission_profile,
+            file_system_sandbox_policy,
+            sandbox_cwd,
+        );
 
     // If the command is flagged as dangerous or we have no sandbox protection,
     // we should never allow it to run without approval.
@@ -562,8 +613,8 @@ pub fn render_decision_for_unmatched_command(
         return match approval_policy {
             AskForApproval::Never => {
                 let sandbox_is_explicitly_disabled = matches!(
-                    sandbox_policy,
-                    SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+                    permission_profile,
+                    PermissionProfile::Disabled | PermissionProfile::External { .. }
                 );
                 if sandbox_is_explicitly_disabled {
                     // If the sandbox is explicitly disabled, we should allow the command to run
@@ -625,6 +676,22 @@ pub fn render_decision_for_unmatched_command(
             }
         },
     }
+}
+
+fn profile_is_managed_read_only(
+    permission_profile: &PermissionProfile,
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    sandbox_cwd: &Path,
+) -> bool {
+    matches!(permission_profile, PermissionProfile::Managed { .. })
+        && matches!(
+            file_system_sandbox_policy.kind,
+            FileSystemSandboxKind::Restricted
+        )
+        && !file_system_sandbox_policy.has_full_disk_write_access()
+        && file_system_sandbox_policy
+            .get_writable_roots_with_cwd(sandbox_cwd)
+            .is_empty()
 }
 
 fn default_policy_path(codex_home: &Path) -> PathBuf {

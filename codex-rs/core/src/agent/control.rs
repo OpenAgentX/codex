@@ -5,21 +5,21 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
 use crate::codex_thread::ThreadConfigSnapshot;
-use crate::error::CodexErr;
-use crate::error::Result as CodexResult;
 use crate::find_archived_thread_path_by_id_str;
 use crate::find_thread_path_by_id_str;
 use crate::rollout::RolloutRecorder;
+use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
-use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_features::Feature;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -28,7 +28,9 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::state_db;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -39,7 +41,6 @@ use tokio::sync::watch;
 use tracing::warn;
 
 const AGENT_NAMES: &str = include_str!("agent_names.txt");
-const FORKED_SPAWN_AGENT_OUTPUT_MESSAGE: &str = "You are the newly spawned agent. The prior conversation history was forked from your parent agent. Treat the next user message as your new task, and use the forked history only as background context.";
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub(crate) enum SpawnAgentForkMode {
 pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
+    pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +95,36 @@ fn agent_nickname_candidates(
         .collect()
 }
 
+fn keep_forked_rollout_item(item: &RolloutItem) -> bool {
+    match item {
+        RolloutItem::ResponseItem(ResponseItem::Message { role, phase, .. }) => match role.as_str()
+        {
+            "system" | "developer" | "user" => true,
+            "assistant" => *phase == Some(MessagePhase::FinalAnswer),
+            _ => false,
+        },
+        RolloutItem::ResponseItem(
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::Other,
+        ) => false,
+        // A forked child gets its own runtime config, including spawned-agent
+        // instructions, so it must establish a fresh context diff baseline.
+        RolloutItem::TurnContext(_) => false,
+        RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
+    }
+}
+
 /// Control-plane handle for multi-agent operations.
 /// `AgentControl` is held by each session (via `SessionServices`). It provides capability to
 /// spawn new agents and the inter-agent communication layer.
@@ -117,6 +149,15 @@ impl AgentControl {
         }
     }
 
+    /// Create a control-plane handle over the same thread manager with an independent live-agent
+    /// registry.
+    pub(crate) fn detached_registry(&self) -> Self {
+        Self {
+            manager: self.manager.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Spawn a new agent thread and submit the initial prompt.
     pub(crate) async fn spawn_agent(
         &self,
@@ -124,15 +165,14 @@ impl AgentControl {
         initial_operation: Op,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
-        Ok(self
-            .spawn_agent_internal(
-                config,
-                initial_operation,
-                session_source,
-                SpawnAgentOptions::default(),
-            )
-            .await?
-            .thread_id)
+        let spawned_agent = Box::pin(self.spawn_agent_internal(
+            config,
+            initial_operation,
+            session_source,
+            SpawnAgentOptions::default(),
+        ))
+        .await?;
+        Ok(spawned_agent.thread_id)
     }
 
     /// Spawn an agent thread with some metadata.
@@ -143,7 +183,7 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions, // TODO(jif) drop with new fork.
     ) -> CodexResult<LiveAgent> {
-        self.spawn_agent_internal(config, initial_operation, session_source, options)
+        Box::pin(self.spawn_agent_internal(config, initial_operation, session_source, options))
             .await
     }
 
@@ -208,6 +248,7 @@ impl AgentControl {
                         /*metrics_service_name*/ None,
                         inherited_shell_snapshot,
                         inherited_exec_policy,
+                        options.environments.clone(),
                     )
                     .await?
             }
@@ -215,6 +256,48 @@ impl AgentControl {
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+
+        if let Some(SessionSource::SubAgent(
+            subagent_source @ SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            },
+        )) = notification_source.as_ref()
+        {
+            let client_metadata = match state.get_thread(*parent_thread_id).await {
+                Ok(parent_thread) => {
+                    parent_thread
+                        .codex
+                        .session
+                        .app_server_client_metadata()
+                        .await
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        parent_thread_id = %parent_thread_id,
+                        "skipping subagent thread analytics: failed to load parent thread metadata"
+                    );
+                    crate::session::session::AppServerClientMetadata {
+                        client_name: None,
+                        client_version: None,
+                    }
+                }
+            };
+            let thread_config = new_thread.thread.codex.thread_config_snapshot().await;
+            emit_subagent_session_started(
+                &new_thread
+                    .thread
+                    .codex
+                    .session
+                    .services
+                    .analytics_events_client,
+                client_metadata,
+                new_thread.thread_id,
+                /*parent_thread_id*/ None,
+                thread_config,
+                subagent_source.clone(),
+            );
+        }
 
         // Notify a new thread has been created. This notification will be processed by clients
         // to subscribe or drain this newly created thread.
@@ -260,11 +343,11 @@ impl AgentControl {
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<crate::thread_manager::NewThread> {
-        let Some(call_id) = options.fork_parent_spawn_call_id.as_deref() else {
+        if options.fork_parent_spawn_call_id.is_none() {
             return Err(CodexErr::Fatal(
                 "spawn_agent fork requires a parent spawn call id".to_string(),
             ));
-        };
+        }
         let Some(fork_mode) = options.fork_mode.as_ref() else {
             return Err(CodexErr::Fatal(
                 "spawn_agent fork requires a fork mode".to_string(),
@@ -289,7 +372,7 @@ impl AgentControl {
                 .session
                 .ensure_rollout_materialized()
                 .await;
-            parent_thread.codex.session.flush_rollout().await;
+            parent_thread.codex.session.flush_rollout().await?;
         }
 
         let rollout_path = parent_thread
@@ -313,16 +396,7 @@ impl AgentControl {
             forked_rollout_items =
                 truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);
         }
-
-        let mut output =
-            FunctionCallOutputPayload::from_text(FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string());
-        output.success = Some(true);
-        forked_rollout_items.push(RolloutItem::ResponseItem(
-            ResponseItem::FunctionCallOutput {
-                call_id: call_id.to_string(),
-                output,
-            },
-        ));
+        forked_rollout_items.retain(keep_forked_rollout_item);
 
         state
             .fork_thread_with_source(
@@ -333,6 +407,7 @@ impl AgentControl {
                 /*persist_extended_history*/ false,
                 inherited_shell_snapshot,
                 inherited_exec_policy,
+                options.environments.clone(),
             )
             .await
     }
@@ -345,9 +420,12 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
-        let resumed_thread_id = self
-            .resume_single_agent_from_rollout(config.clone(), thread_id, session_source)
-            .await?;
+        let resumed_thread_id = Box::pin(self.resume_single_agent_from_rollout(
+            config.clone(),
+            thread_id,
+            session_source,
+        ))
+        .await?;
         let state = self.upgrade()?;
         let Ok(resumed_thread) = state.get_thread(resumed_thread_id).await else {
             return Ok(resumed_thread_id);
@@ -599,7 +677,7 @@ impl AgentControl {
         let state = self.upgrade()?;
         let result = if let Ok(thread) = state.get_thread(agent_id).await {
             thread.codex.session.ensure_rollout_materialized().await;
-            thread.codex.session.flush_rollout().await;
+            thread.codex.session.flush_rollout().await?;
             if matches!(thread.agent_status().await, AgentStatus::Shutdown) {
                 Ok(String::new())
             } else {
@@ -625,7 +703,7 @@ impl AgentControl {
         {
             warn!("failed to persist thread-spawn edge status for {agent_id}: {err}");
         }
-        self.shutdown_agent_tree(agent_id).await
+        Box::pin(self.shutdown_agent_tree(agent_id)).await
     }
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
@@ -665,6 +743,15 @@ impl AgentControl {
 
     pub(crate) fn get_agent_metadata(&self, agent_id: ThreadId) -> Option<AgentMetadata> {
         self.state.agent_metadata_for_thread(agent_id)
+    }
+
+    pub(crate) async fn list_live_agent_subtree_thread_ids(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let mut thread_ids = vec![agent_id];
+        thread_ids.extend(self.live_thread_spawn_descendants(agent_id).await?);
+        Ok(thread_ids)
     }
 
     pub(crate) async fn get_agent_config_snapshot(

@@ -16,7 +16,7 @@
 //!   confirmation, shortcut help, or queue hints.
 //! - "contextual footer" means the footer is free to show ambient context instead of an
 //!   instruction. In that state, the footer may render the configured status line, the active
-//!   agent label, or both combined.
+//!   agent label, side-conversation state, or some combination of those.
 //!
 //! Single-line collapse overview:
 //! 1. The composer decides the current `FooterMode` and hint flags, then calls
@@ -95,6 +95,14 @@ pub(crate) enum CollaborationModeIndicator {
     Execute,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GoalStatusIndicator {
+    Active { usage: Option<String> },
+    Paused,
+    BudgetLimited { usage: Option<String> },
+    Complete { usage: Option<String> },
+}
+
 const MODE_CYCLE_HINT: &str = "shift+tab to cycle";
 const FOOTER_CONTEXT_GAP_COLS: u16 = 1;
 
@@ -130,6 +138,8 @@ impl CollaborationModeIndicator {
 /// (for example, showing `QuitShortcutReminder` only while its timer is active).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FooterMode {
+    /// Single-line incremental history search prompt shown while Ctrl+R search is active.
+    HistorySearch,
     /// Transient "press again to quit" reminder (Ctrl+C/Ctrl+D).
     QuitShortcutReminder,
     /// Multi-line shortcut overlay shown after pressing `?`.
@@ -179,6 +189,7 @@ pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
         FooterMode::EscHint
         | FooterMode::ShortcutOverlay
         | FooterMode::QuitShortcutReminder
+        | FooterMode::HistorySearch
         | FooterMode::ComposerHasDraft => FooterMode::ComposerEmpty,
         other => other,
     }
@@ -188,13 +199,15 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
     let show_shortcuts_hint = match props.mode {
         FooterMode::ComposerEmpty => true,
         FooterMode::ComposerHasDraft => false,
-        FooterMode::QuitShortcutReminder | FooterMode::ShortcutOverlay | FooterMode::EscHint => {
-            false
-        }
+        FooterMode::HistorySearch
+        | FooterMode::QuitShortcutReminder
+        | FooterMode::ShortcutOverlay
+        | FooterMode::EscHint => false,
     };
     let show_queue_hint = match props.mode {
         FooterMode::ComposerHasDraft => props.is_task_running,
         FooterMode::QuitShortcutReminder
+        | FooterMode::HistorySearch
         | FooterMode::ComposerEmpty
         | FooterMode::ShortcutOverlay
         | FooterMode::EscHint => false,
@@ -478,6 +491,46 @@ pub(crate) fn mode_indicator_line(
     indicator.map(|indicator| Line::from(vec![indicator.styled_span(show_cycle_hint)]))
 }
 
+pub(crate) fn goal_status_indicator_line(
+    indicator: Option<&GoalStatusIndicator>,
+) -> Option<Line<'static>> {
+    let indicator = indicator?;
+    let label = match indicator {
+        GoalStatusIndicator::Active { usage } => {
+            if let Some(usage) = usage {
+                format!("Pursuing goal ({usage})")
+            } else {
+                "Pursuing goal".to_string()
+            }
+        }
+        GoalStatusIndicator::Paused => "Goal paused (/goal to unpause)".to_string(),
+        GoalStatusIndicator::BudgetLimited { usage } => {
+            if let Some(usage) = usage {
+                format!("Goal unmet ({usage})")
+            } else {
+                "Goal abandoned".to_string()
+            }
+        }
+        GoalStatusIndicator::Complete { usage } => {
+            if let Some(usage) = usage {
+                format!("Goal achieved ({usage})")
+            } else {
+                "Goal achieved".to_string()
+            }
+        }
+    };
+
+    Some(Line::from(vec![Span::from(label).magenta()]))
+}
+
+pub(crate) fn side_conversation_context_line(label: &str) -> Line<'static> {
+    if let Some(rest) = label.strip_prefix("Side ") {
+        Line::from(vec!["Side".magenta().bold(), format!(" {rest}").magenta()])
+    } else {
+        Line::from(label.to_string()).magenta()
+    }
+}
+
 fn right_aligned_x(area: Rect, content_width: u16) -> Option<u16> {
     if area.is_empty() {
         return None;
@@ -593,6 +646,7 @@ fn footer_from_props_lines(
         FooterMode::QuitShortcutReminder => {
             vec![quit_shortcut_reminder_line(props.quit_shortcut_key)]
         }
+        FooterMode::HistorySearch => vec![Line::from("reverse-i-search: ").dim()],
         FooterMode::ComposerEmpty => {
             let state = LeftSideState {
                 hint: if show_shortcuts_hint {
@@ -666,9 +720,10 @@ pub(crate) fn shows_passive_footer_line(props: &FooterProps) -> bool {
     match props.mode {
         FooterMode::ComposerEmpty => true,
         FooterMode::ComposerHasDraft => !props.is_task_running,
-        FooterMode::QuitShortcutReminder | FooterMode::ShortcutOverlay | FooterMode::EscHint => {
-            false
-        }
+        FooterMode::HistorySearch
+        | FooterMode::QuitShortcutReminder
+        | FooterMode::ShortcutOverlay
+        | FooterMode::EscHint => false,
     }
 }
 
@@ -756,9 +811,12 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let mut paste_image = Line::from("");
     let mut external_editor = Line::from("");
     let mut edit_previous = Line::from("");
+    let mut history_search = Line::from("");
     let mut quit = Line::from("");
     let mut show_transcript = Line::from("");
     let mut change_mode = Line::from("");
+    let mut reasoning_down = Line::from("");
+    let mut reasoning_up = Line::from("");
 
     for descriptor in SHORTCUTS {
         if let Some(text) = descriptor.overlay_entry(state) {
@@ -771,9 +829,12 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
                 ShortcutId::PasteImage => paste_image = text,
                 ShortcutId::ExternalEditor => external_editor = text,
                 ShortcutId::EditPrevious => edit_previous = text,
+                ShortcutId::HistorySearch => history_search = text,
                 ShortcutId::Quit => quit = text,
                 ShortcutId::ShowTranscript => show_transcript = text,
                 ShortcutId::ChangeMode => change_mode = text,
+                ShortcutId::ReasoningDown => reasoning_down = text,
+                ShortcutId::ReasoningUp => reasoning_up = text,
             }
         }
     }
@@ -787,7 +848,10 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
         paste_image,
         external_editor,
         edit_previous,
+        history_search,
         quit,
+        reasoning_down,
+        reasoning_up,
     ];
     if change_mode.width() > 0 {
         ordered.push(change_mode);
@@ -869,9 +933,12 @@ enum ShortcutId {
     PasteImage,
     ExternalEditor,
     EditPrevious,
+    HistorySearch,
     Quit,
     ShowTranscript,
     ChangeMode,
+    ReasoningDown,
+    ReasoningUp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1028,6 +1095,15 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
         label: "",
     },
     ShortcutDescriptor {
+        id: ShortcutId::HistorySearch,
+        bindings: &[ShortcutBinding {
+            key: key_hint::ctrl(KeyCode::Char('r')),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " search history",
+    },
+    ShortcutDescriptor {
         id: ShortcutId::Quit,
         bindings: &[ShortcutBinding {
             key: key_hint::ctrl(KeyCode::Char('c')),
@@ -1053,6 +1129,24 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
         }],
         prefix: "",
         label: " to change mode",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::ReasoningDown,
+        bindings: &[ShortcutBinding {
+            key: key_hint::alt(KeyCode::Char(',')),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " reasoning down",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::ReasoningUp,
+        bindings: &[ShortcutBinding {
+            key: key_hint::alt(KeyCode::Char('.')),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " reasoning up",
     },
 ];
 
@@ -1086,13 +1180,15 @@ mod tests {
                 let show_shortcuts_hint = match props.mode {
                     FooterMode::ComposerEmpty => true,
                     FooterMode::ComposerHasDraft => false,
-                    FooterMode::QuitShortcutReminder
+                    FooterMode::HistorySearch
+                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
                 };
                 let show_queue_hint = match props.mode {
                     FooterMode::ComposerHasDraft => props.is_task_running,
-                    FooterMode::QuitShortcutReminder
+                    FooterMode::HistorySearch
+                    | FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
                     | FooterMode::EscHint => false,
@@ -1227,6 +1323,7 @@ mod tests {
                         && !matches!(
                             props.mode,
                             FooterMode::EscHint
+                                | FooterMode::HistorySearch
                                 | FooterMode::QuitShortcutReminder
                                 | FooterMode::ShortcutOverlay
                         );

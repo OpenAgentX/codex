@@ -11,7 +11,7 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
         approval_id: Some("call-short".into()),
         turn_id: "turn-short".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
@@ -53,8 +53,8 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
 #[test]
 fn app_server_exec_approval_request_splits_shell_wrapped_command() {
     let script = r#"python3 -c 'print("Hello, world!")'"#;
-    let request =
-        exec_approval_request_from_params(AppServerCommandExecutionRequestApprovalParams {
+    let request = exec_approval_request_from_params(
+        AppServerCommandExecutionRequestApprovalParams {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             item_id: "item-1".to_string(),
@@ -65,13 +65,15 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
                 shlex::try_join(["/bin/zsh", "-lc", script])
                     .expect("round-trippable shell wrapper"),
             ),
-            cwd: Some(PathBuf::from("/tmp")),
+            cwd: Some(test_path_buf("/tmp").abs()),
             command_actions: None,
             additional_permissions: None,
             proposed_execpolicy_amendment: None,
             proposed_network_policy_amendments: None,
             available_decisions: None,
-        });
+        },
+        &test_path_buf("/tmp").abs(),
+    );
 
     assert_eq!(
         request.command,
@@ -94,7 +96,7 @@ async fn exec_approval_uses_approval_id_when_present() {
             approval_id: Some("approval-subcommand".into()),
             turn_id: "turn-short".into(),
             command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            cwd: AbsolutePathBuf::current_dir().expect("current dir"),
             reason: Some(
                 "this is a test reason such as one that would be produced by the model".into(),
             ),
@@ -135,7 +137,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         approval_id: Some("call-multi".into()),
         turn_id: "turn-multi".into(),
         command: vec!["bash".into(), "-lc".into(), "echo line1\necho line2".into()],
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
@@ -192,7 +194,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         approval_id: Some("call-long".into()),
         turn_id: "turn-long".into(),
         command: vec!["bash".into(), "-lc".into(), long],
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: None,
         network_approval_context: None,
         proposed_execpolicy_amendment: None,
@@ -355,7 +357,7 @@ async fn exec_end_without_begin_uses_event_command() {
         "echo orphaned".to_string(),
     ];
     let parsed_cmd = codex_shell_command::parse_command::parse_command(&command);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     chat.handle_codex_event(Event {
         id: "call-orphan".to_string(),
         msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
@@ -635,6 +637,7 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
         id: "turn-1".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -649,6 +652,9 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Final response.".into()),
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
         }),
     });
 
@@ -667,6 +673,7 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         id: "turn-1".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -691,6 +698,9 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
         }),
     });
 
@@ -756,6 +766,9 @@ async fn unified_exec_waiting_multiple_empty_snapshots() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
         }),
     });
 
@@ -834,6 +847,9 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
         }),
     });
 
@@ -856,17 +872,13 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
 #[tokio::test]
 async fn view_image_tool_call_adds_history_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let image_path = chat
-        .config
-        .cwd
-        .join("example.png")
-        .expect("absolute image path");
+    let image_path = chat.config.cwd.join("example.png");
 
     chat.handle_codex_event(Event {
         id: "sub-image".into(),
         msg: EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
             call_id: "call-image".into(),
-            path: image_path.to_path_buf(),
+            path: image_path,
         }),
     });
 
@@ -887,13 +899,17 @@ async fn image_generation_call_adds_history_cell() {
             status: "completed".into(),
             revised_prompt: Some("A tiny blue square".into()),
             result: "Zm9v".into(),
-            saved_path: Some("file:///tmp/ig-1.png".into()),
+            saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
         }),
     });
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected a single history cell");
-    let combined = lines_to_single_string(&cells[0]);
+    let platform_file_url = url::Url::from_file_path(test_path_buf("/tmp/ig-1.png"))
+        .expect("test path should convert to file URL")
+        .to_string();
+    let combined =
+        lines_to_single_string(&cells[0]).replace(&platform_file_url, "file:///tmp/ig-1.png");
     assert_chatwidget_snapshot!("image_generation_call_history_snapshot", combined);
 }
 
@@ -975,7 +991,7 @@ async fn user_shell_command_renders_output_not_exploring() {
 }
 
 #[tokio::test]
-async fn bang_shell_command_submits_run_user_shell_command_in_app_server_tui() {
+async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let conversation_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
@@ -989,7 +1005,8 @@ async fn bang_shell_command_submits_run_user_shell_command_in_app_server_tui() {
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        cwd: PathBuf::from("/home/user/project"),
+        permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
         history_entry_count: 0,
@@ -1003,6 +1020,15 @@ async fn bang_shell_command_submits_run_user_shell_command_in_app_server_tui() {
     });
     drain_insert_history(&mut rx);
     while op_rx.try_recv().is_ok() {}
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
 
     chat.bottom_pane
         .set_composer_text("!echo hi".to_string(), Vec::new(), Vec::new());
@@ -1012,7 +1038,64 @@ async fn bang_shell_command_submits_run_user_shell_command_in_app_server_tui() {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected RunUserShellCommand op, got {other:?}"),
     }
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::AddToHistory { text }) if text == "!echo hi"
+    );
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn user_message_during_user_shell_command_is_queued_not_steered() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    let begin = begin_exec_with_source(
+        &mut chat,
+        "user-shell-sleep",
+        "sleep 10",
+        ExecCommandSource::UserShell,
+    );
+
+    assert!(chat.only_user_shell_commands_running());
+    chat.bottom_pane
+        .set_composer_text("hi".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(chat.queued_user_message_texts(), vec!["hi".to_string()]);
+
+    end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
+    chat.handle_codex_event(Event {
+        id: "turn-complete".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("done".to_string()),
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        }),
+    });
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "hi".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected queued user message after shell completion, got {other:?}"),
+    }
+    assert!(chat.queued_user_messages.is_empty());
 }
 
 #[tokio::test]
@@ -1054,7 +1137,7 @@ async fn approval_modal_exec_snapshot() -> anyhow::Result<()> {
         approval_id: Some("call-approve-cmd".into()),
         turn_id: "turn-approve-cmd".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
@@ -1117,7 +1200,7 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
         approval_id: Some("call-approve-cmd-noreason".into()),
         turn_id: "turn-approve-cmd-noreason".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: None,
         network_approval_context: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
@@ -1169,7 +1252,7 @@ async fn approval_modal_exec_multiline_prefix_hides_execpolicy_option_snapshot()
         approval_id: Some("call-approve-cmd-multiline-trunc".into()),
         turn_id: "turn-approve-cmd-multiline-trunc".into(),
         command: command.clone(),
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd: AbsolutePathBuf::current_dir().expect("current dir"),
         reason: None,
         network_approval_context: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(command)),
@@ -1238,10 +1321,9 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw patch approval modal");
-    assert_chatwidget_snapshot!(
-        "approval_modal_patch",
-        terminal.backend().vt100().screen().contents()
-    );
+    let contents = terminal.backend().vt100().screen().contents();
+    assert!(!contents.contains("$ apply_patch"));
+    assert_chatwidget_snapshot!("approval_modal_patch", contents);
 
     Ok(())
 }
@@ -1259,6 +1341,8 @@ async fn interrupt_preserves_unified_exec_processes() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -1291,6 +1375,7 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
         id: "turn-1".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -1304,6 +1389,8 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -1331,6 +1418,9 @@ async fn turn_complete_keeps_unified_exec_processes() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
         }),
     });
 
@@ -1378,27 +1468,10 @@ async fn apply_patch_events_emit_history_cells() {
         id: "s1".into(),
         msg: EventMsg::ApplyPatchApprovalRequest(ev),
     });
-    let cells = drain_insert_history(&mut rx);
     assert!(
-        cells.is_empty(),
+        drain_insert_history(&mut rx).is_empty(),
         "expected approval request to surface via modal without emitting history cells"
     );
-
-    let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    chat.render(area, &mut buf);
-    let mut saw_summary = false;
-    for y in 0..area.height {
-        let mut row = String::new();
-        for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
-        }
-        if row.contains("foo.txt (+1 -0)") {
-            saw_summary = true;
-            break;
-        }
-    }
-    assert!(saw_summary, "expected approval modal to show diff summary");
 
     // 2) Begin apply -> per-file apply block cell (no global header)
     let mut changes2 = HashMap::new();
@@ -1729,7 +1802,7 @@ async fn apply_patch_untrusted_shows_approval_modal() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
+async fn apply_patch_request_omits_diff_summary_from_modal() -> anyhow::Result<()> {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     // Ensure we are in OnRequest so an approval is surfaced
@@ -1758,43 +1831,24 @@ async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
         }),
     });
 
-    // No history entries yet; the modal should contain the diff summary
-    let cells = drain_insert_history(&mut rx);
     assert!(
-        cells.is_empty(),
+        drain_insert_history(&mut rx).is_empty(),
         "expected approval request to render via modal instead of history"
     );
 
     let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
     let mut buf = ratatui::buffer::Buffer::empty(area);
     chat.render(area, &mut buf);
-
-    let mut saw_header = false;
-    let mut saw_line1 = false;
-    let mut saw_line2 = false;
+    let mut contents = String::new();
     for y in 0..area.height {
-        let mut row = String::new();
         for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            contents.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
         }
-        if row.contains("README.md (+2 -0)") {
-            saw_header = true;
-        }
-        if row.contains("+line one") {
-            saw_line1 = true;
-        }
-        if row.contains("+line two") {
-            saw_line2 = true;
-        }
-        if saw_header && saw_line1 && saw_line2 {
-            break;
-        }
+        contents.push('\n');
     }
-    assert!(saw_header, "expected modal to show diff header with totals");
-    assert!(
-        saw_line1 && saw_line2,
-        "expected modal to show per-line diff summary"
-    );
+    assert!(!contents.contains("README.md (+2 -0)"));
+    assert!(!contents.contains("+line one"));
+    assert!(!contents.contains("+line two"));
 
     Ok(())
 }

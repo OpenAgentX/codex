@@ -93,6 +93,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -132,6 +135,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 items: Vec::new(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -139,6 +145,115 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
+}
+
+#[tokio::test]
+async fn live_app_server_turn_started_sets_feedback_turn_id() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    chat.open_feedback_note(
+        crate::app_event::FeedbackCategory::Bug,
+        /*include_logs*/ false,
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::SubmitFeedback {
+            category: crate::app_event::FeedbackCategory::Bug,
+            reason: None,
+            turn_id: Some(turn_id),
+            include_logs: false,
+        }) if turn_id == "turn-1"
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_warning_notification_renders_message() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::Warning(WarningNotification {
+            thread_id: None,
+            message: "Warning: Exceeded skills context budget of 2%. All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list.".to_string(),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one warning history cell");
+    let rendered = lines_to_single_string(&cells[0]);
+    let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("Warning: Exceeded skills context budget of 2%."),
+        "expected warning notification message, got {rendered}"
+    );
+    assert!(
+        normalized.contains(
+            "All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list."
+        ),
+        "expected warning guidance, got {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_guardian_warning_notification_renders_message() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::GuardianWarning(GuardianWarningNotification {
+            thread_id: "thread-1".to_string(),
+            message: "Automatic approval review denied the requested action.".to_string(),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one warning history cell");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Automatic approval review denied the requested action."),
+        "expected guardian warning notification message, got {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_config_warning_prefixes_summary() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::ConfigWarning(ConfigWarningNotification {
+            summary: "Invalid configuration; using defaults.".to_string(),
+            details: None,
+            path: None,
+            range: None,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one warning history cell");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Invalid configuration; using defaults."),
+        "expected config warning summary, got {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -185,7 +300,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: command.clone(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::InProgress,
@@ -206,7 +321,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command,
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::Completed,
@@ -231,25 +346,6 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     assert_chatwidget_snapshot!(
         "live_app_server_command_execution_strips_shell_wrapper",
         blob
-    );
-}
-
-#[test]
-fn app_server_patch_changes_to_core_preserves_diffs() {
-    let changes = app_server_patch_changes_to_core(vec![FileUpdateChange {
-        path: "foo.txt".to_string(),
-        kind: PatchChangeKind::Add,
-        diff: "hello\n".to_string(),
-    }]);
-
-    assert_eq!(
-        changes,
-        HashMap::from([(
-            PathBuf::from("foo.txt"),
-            FileChange::Add {
-                content: "hello\n".to_string(),
-            },
-        )])
     );
 }
 
@@ -415,6 +511,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -450,6 +549,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                     codex_error_info: None,
                     additional_details: None,
                 }),
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -471,6 +573,9 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -525,6 +630,9 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -552,6 +660,72 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
 }
 
 #[tokio::test]
+async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::Error(ErrorNotification {
+            error: AppServerTurnError {
+                message: "server fallback message".to_string(),
+                codex_error_info: Some(CodexErrorInfo::CyberPolicy.into()),
+                additional_details: None,
+            },
+            will_retry: false,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(rendered.contains("This chat was flagged for possible cybersecurity risk"));
+    assert!(rendered.contains("Trusted Access for Cyber"));
+    assert!(!rendered.contains("server fallback message"));
+    assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn live_app_server_model_verification_renders_warning() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::ModelVerification(ModelVerificationNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            verifications: vec![AppServerModelVerification::TrustedAccessForCyber],
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(rendered.contains("multiple flags for possible cybersecurity risk"));
+    assert!(rendered.contains("extra safety checks are on"));
+    assert!(rendered.contains("Trusted Access for Cyber"));
+    assert!(rendered.contains("https://chatgpt.com/cyber"));
+}
+
+#[tokio::test]
 async fn live_app_server_invalid_thread_name_update_is_ignored() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let thread_id = ThreadId::new();
@@ -570,6 +744,30 @@ async fn live_app_server_invalid_thread_name_update_is_ignored() {
 
     assert_eq!(chat.thread_id, Some(thread_id));
     assert_eq!(chat.thread_name, Some("original name".to_string()));
+}
+
+#[tokio::test]
+async fn live_app_server_thread_name_update_shows_resume_hint() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                thread_name: Some("review-fix".to_string()),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.thread_name, Some("review-fix".to_string()));
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(rendered.contains("Thread renamed to review-fix"));
+    assert!(rendered.contains("codex resume review-fix"));
 }
 
 #[tokio::test]

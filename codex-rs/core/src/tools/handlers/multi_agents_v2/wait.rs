@@ -6,7 +6,6 @@ use tokio::time::timeout_at;
 
 pub(crate) struct Handler;
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = WaitAgentResult;
 
@@ -53,8 +52,12 @@ impl ToolHandler for Handler {
             )
             .await;
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let timed_out = !wait_for_mailbox_change(&mut mailbox_seq_rx, deadline).await;
+        let timed_out = if session.has_pending_mailbox_items().await {
+            false
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            !wait_for_mailbox_change(&mut mailbox_seq_rx, deadline).await
+        };
         let result = WaitAgentResult::from_timed_out(timed_out);
 
         session
@@ -75,6 +78,7 @@ impl ToolHandler for Handler {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WaitArgs {
     timeout_ms: Option<i64>,
 }
