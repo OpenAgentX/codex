@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use crate::ExecServerError;
 use crate::ExecServerRuntimePaths;
+use crate::ExecutorFileSystem;
 use crate::HttpClient;
 use crate::client::LazyRemoteExecServerClient;
 use crate::client::http_client::ReqwestHttpClient;
-use crate::file_system::ExecutorFileSystem;
 use crate::local_file_system::LocalFileSystem;
 use crate::local_process::LocalProcess;
 use crate::process::ExecBackend;
@@ -113,6 +113,11 @@ impl EnvironmentManager {
         self.default_environment
             .as_deref()
             .and_then(|environment_id| self.get_environment(environment_id))
+    }
+
+    /// Returns the id of the default environment.
+    pub fn default_environment_id(&self) -> Option<&str> {
+        self.default_environment.as_deref()
     }
 
     /// Returns the local environment instance used for internal runtime work.
@@ -304,6 +309,7 @@ mod tests {
         });
 
         let environment = manager.default_environment().expect("default environment");
+        assert_eq!(manager.default_environment_id(), Some(LOCAL_ENVIRONMENT_ID));
         assert!(!environment.is_remote());
         assert!(
             !manager
@@ -322,6 +328,7 @@ mod tests {
         });
 
         assert!(manager.default_environment().is_none());
+        assert_eq!(manager.default_environment_id(), None);
         assert!(
             !manager
                 .get_environment(LOCAL_ENVIRONMENT_ID)
@@ -339,6 +346,10 @@ mod tests {
         });
 
         let environment = manager.default_environment().expect("default environment");
+        assert_eq!(
+            manager.default_environment_id(),
+            Some(REMOTE_ENVIRONMENT_ID)
+        );
         assert!(environment.is_remote());
         assert_eq!(environment.exec_server_url(), Some("ws://127.0.0.1:8765"));
         assert!(Arc::ptr_eq(
@@ -399,6 +410,7 @@ mod tests {
         });
 
         assert!(manager.default_environment().is_none());
+        assert_eq!(manager.default_environment_id(), None);
     }
 
     #[tokio::test]
@@ -409,6 +421,7 @@ mod tests {
         });
 
         assert!(manager.default_environment().is_none());
+        assert_eq!(manager.default_environment_id(), None);
         assert!(
             !manager
                 .get_environment(LOCAL_ENVIRONMENT_ID)

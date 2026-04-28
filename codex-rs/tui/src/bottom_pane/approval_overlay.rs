@@ -9,7 +9,6 @@ use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::list_selection_view::ListSelectionView;
 use crate::bottom_pane::list_selection_view::SelectionItem;
 use crate::bottom_pane::list_selection_view::SelectionViewParams;
-use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell;
 use crate::key_hint;
@@ -20,7 +19,7 @@ use crate::render::renderable::Renderable;
 use codex_features::Features;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::RequestId;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -58,7 +57,7 @@ pub(crate) enum ApprovalRequest {
         reason: Option<String>,
         available_decisions: Vec<ReviewDecision>,
         network_approval_context: Option<NetworkApprovalContext>,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     },
     Permissions {
         thread_id: ThreadId,
@@ -103,7 +102,7 @@ impl ApprovalRequest {
         }
     }
 
-    fn matches_resolved_request(&self, request: &ResolvedAppServerRequest) -> bool {
+    pub(super) fn matches_resolved_request(&self, request: &ResolvedAppServerRequest) -> bool {
         match (self, request) {
             (
                 ApprovalRequest::Exec { id, .. },
@@ -529,6 +528,10 @@ impl BottomPaneView for ApprovalOverlay {
     fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
         self.dismiss_resolved_request(request)
     }
+
+    fn terminal_title_requires_action(&self) -> bool {
+        true
+    }
 }
 
 impl Renderable for ApprovalOverlay {
@@ -633,8 +636,6 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
         ApprovalRequest::ApplyPatch {
             thread_label,
             reason,
-            cwd,
-            changes,
             ..
         } => {
             let mut header: Vec<Box<dyn Renderable>> = Vec::new();
@@ -643,11 +644,13 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                     "Thread: ".into(),
                     thread_label.clone().bold(),
                 ])));
-                header.push(Box::new(Line::from("")));
             }
             if let Some(reason) = reason
                 && !reason.is_empty()
             {
+                if !header.is_empty() {
+                    header.push(Box::new(Line::from("")));
+                }
                 header.push(Box::new(
                     Paragraph::new(Line::from_iter([
                         "Reason: ".into(),
@@ -655,9 +658,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                     ]))
                     .wrap(Wrap { trim: false }),
                 ));
-                header.push(Box::new(Line::from("")));
             }
-            header.push(DiffSummary::new(changes.clone(), cwd.clone()).into());
             Box::new(ColumnRenderable::with(header))
         }
         ApprovalRequest::McpElicitation {
@@ -719,7 +720,7 @@ impl ApprovalOption {
 fn exec_options(
     available_decisions: &[ReviewDecision],
     network_approval_context: Option<&NetworkApprovalContext>,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> Vec<ApprovalOption> {
     available_decisions
         .iter()
@@ -808,7 +809,7 @@ fn exec_options(
 }
 
 pub(crate) fn format_additional_permissions_rule(
-    additional_permissions: &PermissionProfile,
+    additional_permissions: &AdditionalPermissionProfile,
 ) -> Option<String> {
     let mut parts = Vec::new();
     if additional_permissions
@@ -878,7 +879,6 @@ fn special_path_label(value: &FileSystemSpecialPath) -> String {
     match value {
         FileSystemSpecialPath::Root => ":root".to_string(),
         FileSystemSpecialPath::Minimal => ":minimal".to_string(),
-        FileSystemSpecialPath::CurrentWorkingDirectory => ":cwd".to_string(),
         FileSystemSpecialPath::ProjectRoots { subpath } => path_label(":project_roots", subpath),
         FileSystemSpecialPath::Tmpdir => ":tmpdir".to_string(),
         FileSystemSpecialPath::SlashTmp => "/tmp".to_string(),
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn additional_permissions_exec_options_hide_execpolicy_amendment() {
-        let additional_permissions = PermissionProfile {
+        let additional_permissions = AdditionalPermissionProfile {
             file_system: Some(FileSystemPermissions::from_read_write_roots(
                 Some(vec![absolute_path("/tmp/readme.txt")]),
                 Some(vec![absolute_path("/tmp/out.txt")]),
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn additional_permissions_rule_shows_non_path_file_system_entries() {
-        let additional_permissions = PermissionProfile {
+        let additional_permissions = AdditionalPermissionProfile {
             file_system: Some(FileSystemPermissions {
                 entries: vec![
                     FileSystemSandboxEntry {
@@ -1477,7 +1477,7 @@ mod tests {
             reason: None,
             available_decisions: vec![ReviewDecision::Approved, ReviewDecision::Abort],
             network_approval_context: None,
-            additional_permissions: Some(PermissionProfile {
+            additional_permissions: Some(AdditionalPermissionProfile {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
                 }),
@@ -1527,7 +1527,7 @@ mod tests {
             reason: Some("need filesystem access".into()),
             available_decisions: vec![ReviewDecision::Approved, ReviewDecision::Abort],
             network_approval_context: None,
-            additional_permissions: Some(PermissionProfile {
+            additional_permissions: Some(AdditionalPermissionProfile {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
                 }),
@@ -1554,6 +1554,32 @@ mod tests {
             "approval_overlay_permissions_prompt",
             normalize_snapshot_paths(render_overlay_lines(&view, /*width*/ 120))
         );
+    }
+
+    #[test]
+    fn apply_patch_prompt_with_thread_label_omits_command_line() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut changes = HashMap::new();
+        changes.insert(
+            PathBuf::from("bug1.txt"),
+            FileChange::Add {
+                content: "one\ntwo\nthree\n".to_string(),
+            },
+        );
+        let request = ApprovalRequest::ApplyPatch {
+            thread_id: ThreadId::new(),
+            thread_label: Some("Banach [worker]".to_string()),
+            id: "test".to_string(),
+            reason: None,
+            cwd: absolute_path("/tmp"),
+            changes,
+        };
+        let view = ApprovalOverlay::new(request, tx, Features::with_defaults());
+        let rendered = render_overlay_lines(&view, /*width*/ 120);
+        assert!(rendered.contains("Thread: Banach [worker]"));
+        assert!(rendered.contains("o to open thread"));
+        assert!(!rendered.contains("$ apply_patch"));
     }
 
     #[test]

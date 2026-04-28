@@ -349,25 +349,6 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     );
 }
 
-#[test]
-fn app_server_patch_changes_to_core_preserves_diffs() {
-    let changes = app_server_patch_changes_to_core(vec![FileUpdateChange {
-        path: "foo.txt".to_string(),
-        kind: PatchChangeKind::Add,
-        diff: "hello\n".to_string(),
-    }]);
-
-    assert_eq!(
-        changes,
-        HashMap::from([(
-            PathBuf::from("foo.txt"),
-            FileChange::Add {
-                content: "hello\n".to_string(),
-            },
-        )])
-    );
-}
-
 #[tokio::test]
 async fn live_app_server_collab_wait_items_render_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -738,8 +719,9 @@ async fn live_app_server_model_verification_renders_warning() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
-    assert!(rendered.contains("flagged for potentially high-risk cyber activity"));
-    assert!(rendered.contains("slower while additional verification"));
+    assert!(rendered.contains("multiple flags for possible cybersecurity risk"));
+    assert!(rendered.contains("extra safety checks are on"));
+    assert!(rendered.contains("Trusted Access for Cyber"));
     assert!(rendered.contains("https://chatgpt.com/cyber"));
 }
 
