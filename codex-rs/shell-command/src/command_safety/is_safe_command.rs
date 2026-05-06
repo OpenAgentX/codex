@@ -6,6 +6,8 @@ use crate::command_safety::is_dangerous_command::executable_name_lookup_key;
 use crate::command_safety::is_dangerous_command::find_git_subcommand;
 use crate::command_safety::is_dangerous_command::git_global_option_requires_prompt;
 use crate::command_safety::windows_safe_commands::is_safe_command_windows;
+#[cfg(windows)]
+use crate::command_safety::windows_safe_commands::is_safe_powershell_words as is_safe_powershell_words_windows;
 
 pub fn is_known_safe_command(command: &[String]) -> bool {
     let command: Vec<String> = command
@@ -42,6 +44,21 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
         return true;
     }
     false
+}
+
+/// Returns whether already-tokenized PowerShell words are read-only enough to
+/// be auto-approved by the Windows safelist.
+pub fn is_safe_powershell_words(command: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        is_safe_powershell_words_windows(command)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+        false
+    }
 }
 
 fn is_safe_to_call_with_exec(command: &[String]) -> bool {
@@ -134,36 +151,7 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         }
 
         // Git
-        Some("git") => {
-            // Global options that redirect config, repository, or helper
-            // lookup can make otherwise read-only git commands execute
-            // attacker-controlled code, so they must never be auto-approved.
-            if git_has_unsafe_global_option(command) {
-                return false;
-            }
-
-            let Some((subcommand_idx, subcommand)) =
-                find_git_subcommand(command, &["status", "log", "diff", "show", "branch"])
-            else {
-                return false;
-            };
-
-            let subcommand_args = &command[subcommand_idx + 1..];
-
-            match subcommand {
-                "status" | "log" | "diff" | "show" => {
-                    git_subcommand_args_are_read_only(subcommand_args)
-                }
-                "branch" => {
-                    git_subcommand_args_are_read_only(subcommand_args)
-                        && git_branch_is_read_only(subcommand_args)
-                }
-                other => {
-                    debug_assert!(false, "unexpected git subcommand from matcher: {other}");
-                    false
-                }
-            }
-        }
+        Some("git") => is_safe_git_command(command),
 
         // Special-case `sed -n {N|M,N}p`
         Some("sed")
@@ -178,6 +166,35 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
 
         // ── anything else ─────────────────────────────────────────────────
         _ => false,
+    }
+}
+
+pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
+    // Global options that redirect config, repository, or helper lookup can make
+    // otherwise read-only git commands execute attacker-controlled code, so they
+    // must never be auto-approved.
+    if git_has_unsafe_global_option(command) {
+        return false;
+    }
+
+    let Some((subcommand_idx, subcommand)) =
+        find_git_subcommand(command, &["status", "log", "diff", "show", "branch"])
+    else {
+        return false;
+    };
+
+    let subcommand_args = &command[subcommand_idx + 1..];
+
+    match subcommand {
+        "status" | "log" | "diff" | "show" => git_subcommand_args_are_read_only(subcommand_args),
+        "branch" => {
+            git_subcommand_args_are_read_only(subcommand_args)
+                && git_branch_is_read_only(subcommand_args)
+        }
+        other => {
+            debug_assert!(false, "unexpected git subcommand from matcher: {other}");
+            false
+        }
     }
 }
 
@@ -331,20 +348,19 @@ mod tests {
 
     #[test]
     fn git_branch_global_options_respect_safety_rules() {
-        use pretty_assertions::assert_eq;
-
-        assert_eq!(
-            is_known_safe_command(&vec_str(&["git", "-C", ".", "branch", "--show-current"])),
-            true
-        );
-        assert_eq!(
-            is_known_safe_command(&vec_str(&["git", "-C", ".", "branch", "-d", "feature"])),
-            false
-        );
-        assert_eq!(
-            is_known_safe_command(&vec_str(&["bash", "-lc", "git -C . branch -d feature",])),
-            false
-        );
+        assert!(is_known_safe_command(&vec_str(&[
+            "git",
+            "branch",
+            "--show-current",
+        ])));
+        assert!(!is_known_safe_command(&vec_str(&[
+            "git", "branch", "-d", "feature",
+        ])));
+        assert!(!is_known_safe_command(&vec_str(&[
+            "bash",
+            "-lc",
+            "git branch -d feature",
+        ])));
     }
 
     #[test]
@@ -382,6 +398,10 @@ mod tests {
     #[test]
     fn git_global_override_flags_are_not_safe() {
         assert!(!is_known_safe_command(&vec_str(&[
+            "git", "-C", ".", "status",
+        ])));
+        assert!(!is_known_safe_command(&vec_str(&["git", "-C.", "status",])));
+        assert!(!is_known_safe_command(&vec_str(&[
             "git",
             "-c",
             "core.pager=cat",
@@ -415,6 +435,11 @@ mod tests {
             );
         }
 
+        assert!(!is_known_safe_command(&vec_str(&[
+            "bash",
+            "-lc",
+            "git -C .project-deps/test-fixtures status",
+        ])));
         assert!(!is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
@@ -517,8 +542,15 @@ mod tests {
             return;
         }
 
+        let Some(powershell) = crate::powershell::try_find_pwsh_executable_blocking()
+            .or_else(crate::powershell::try_find_powershell_executable_blocking)
+        else {
+            return;
+        };
+        let powershell = powershell.as_path().to_str().unwrap();
+
         assert!(is_known_safe_command(&vec_str(&[
-            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            powershell,
             "-Command",
             "Get-Location",
         ])));
@@ -629,5 +661,16 @@ mod tests {
             !is_known_safe_command(&vec_str(&["bash", "-lc", "ls > out.txt"])),
             "> redirection should be rejected"
         );
+    }
+
+    #[test]
+    fn direct_powershell_words_use_windows_safelist() {
+        let command = vec_str(&["Get-Content", "Cargo.toml"]);
+
+        if cfg!(windows) {
+            assert!(is_safe_powershell_words(&command));
+        } else {
+            assert!(!is_safe_powershell_words(&command));
+        }
     }
 }

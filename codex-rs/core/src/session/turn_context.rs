@@ -1,11 +1,16 @@
 use super::*;
+use crate::SkillLoadOutcome;
+use crate::config::GhostSnapshotConfig;
+use crate::environment_selection::ResolvedTurnEnvironments;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
+use codex_tools::ToolEnvironmentMode;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -33,6 +38,7 @@ pub(crate) struct TurnEnvironment {
     pub(crate) environment_id: String,
     pub(crate) environment: Arc<Environment>,
     pub(crate) cwd: AbsolutePathBuf,
+    pub(crate) shell: String,
 }
 
 impl TurnEnvironment {
@@ -58,8 +64,8 @@ pub(crate) struct TurnContext {
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) session_source: SessionSource,
-    pub(crate) environment: Option<Arc<Environment>>,
-    pub(crate) environments: Vec<TurnEnvironment>,
+    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) environments: ResolvedTurnEnvironments,
     /// The session's absolute working directory. All relative paths provided
     /// by the model as well as sandbox policies are resolved against this path
     /// instead of `std::env::current_dir()`.
@@ -114,6 +120,21 @@ impl TurnContext {
             network_sandbox_policy,
             &self.cwd,
         )
+    }
+
+    pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        if self.model_info.supports_reasoning_summaries {
+            self.reasoning_effort
+                .or(self.model_info.default_reasoning_level)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
+        self.effective_reasoning_effort()
+            .map(|effort| effort.to_string())
+            .unwrap_or_else(|| "default".to_string())
     }
 
     pub(crate) fn model_context_window(&self) -> Option<i64> {
@@ -172,6 +193,7 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let features = self.features.clone();
+        let provider_capabilities = self.provider.capabilities();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             available_models: &models_manager
@@ -186,10 +208,13 @@ impl TurnContext {
             permission_profile: &self.permission_profile,
             windows_sandbox_level: self.windows_sandbox_level,
         })
+        .with_namespace_tools_capability(provider_capabilities.namespace_tools)
+        .with_image_generation_capability(provider_capabilities.image_generation)
+        .with_web_search_capability(provider_capabilities.web_search)
         .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
-        .with_has_environment(self.tools_config.has_environment)
+        .with_environment_mode(self.tools_config.environment_mode)
         .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
@@ -199,6 +224,12 @@ impl TurnContext {
                 .features
                 .enabled(Feature::MultiAgentV2)
                 .then_some(config.multi_agent_v2.max_concurrent_threads_per_session),
+        )
+        .with_wait_agent_min_timeout_ms(
+            config
+                .features
+                .enabled(Feature::MultiAgentV2)
+                .then_some(config.multi_agent_v2.min_wait_timeout_ms),
         )
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
@@ -219,7 +250,7 @@ impl TurnContext {
             reasoning_effort,
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
-            environment: self.environment.clone(),
+            thread_source: self.thread_source,
             environments: self.environments.clone(),
             cwd: self.cwd.clone(),
             current_date: self.current_date.clone(),
@@ -421,8 +452,7 @@ impl Session {
         model_info: ModelInfo,
         models_manager: &SharedModelsManager,
         network: Option<NetworkProxy>,
-        environment: Option<Arc<Environment>>,
-        environments: Vec<TurnEnvironment>,
+        environments: ResolvedTurnEnvironments,
         cwd: AbsolutePathBuf,
         sub_id: String,
         skills_outcome: Arc<SkillLoadOutcome>,
@@ -441,6 +471,7 @@ impl Session {
             image_generation_tool_auth_allowed(auth_manager.as_deref());
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
+        let provider_capabilities = provider_for_context.capabilities();
         let session_telemetry_for_context = session_telemetry;
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
@@ -452,6 +483,9 @@ impl Session {
             permission_profile: &session_configuration.permission_profile(),
             windows_sandbox_level: session_configuration.windows_sandbox_level,
         })
+        .with_namespace_tools_capability(provider_capabilities.namespace_tools)
+        .with_image_generation_capability(provider_capabilities.image_generation)
+        .with_web_search_capability(provider_capabilities.web_search)
         .with_unified_exec_shell_mode_for_session(
             crate::tools::spec::tool_user_shell_type(user_shell),
             shell_zsh_path,
@@ -459,7 +493,9 @@ impl Session {
         )
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
-        .with_has_environment(environment.is_some())
+        .with_environment_mode(ToolEnvironmentMode::from_count(
+            environments.turn_environments.len(),
+        ))
         .with_spawn_agent_usage_hint(per_turn_config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(per_turn_config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(per_turn_config.multi_agent_v2.hide_spawn_agent_metadata)
@@ -474,6 +510,12 @@ impl Session {
                         .max_concurrent_threads_per_session,
                 ),
         )
+        .with_wait_agent_min_timeout_ms(
+            per_turn_config
+                .features
+                .enabled(Feature::MultiAgentV2)
+                .then_some(per_turn_config.multi_agent_v2.min_wait_timeout_ms),
+        )
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &per_turn_config.agent_roles,
         ));
@@ -481,7 +523,7 @@ impl Session {
         let per_turn_config = Arc::new(per_turn_config);
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
             conversation_id.to_string(),
-            &session_source,
+            session_configuration.thread_source,
             sub_id.clone(),
             cwd.clone(),
             &session_configuration.permission_profile(),
@@ -501,7 +543,7 @@ impl Session {
             reasoning_effort,
             reasoning_summary,
             session_source,
-            environment,
+            thread_source: session_configuration.thread_source,
             environments,
             cwd,
             current_date: Some(current_date),
@@ -543,10 +585,16 @@ impl Session {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(&updates) {
                 Ok(next) => {
-                    let effective_environments = updates
+                    let mut effective_environments = updates
                         .environments
                         .clone()
                         .unwrap_or_else(|| next.environments.clone());
+                    if updates.environments.is_none() {
+                        Self::overlay_runtime_cwd_on_primary_environment(
+                            &mut effective_environments,
+                            &next.cwd,
+                        );
+                    }
                     let turn_environments =
                         self.resolve_turn_environments(&effective_environments)?;
                     let previous_cwd = state.session_configuration.cwd.clone();
@@ -619,28 +667,11 @@ impl Session {
     fn resolve_turn_environments(
         &self,
         environments: &[TurnEnvironmentSelection],
-    ) -> CodexResult<Vec<TurnEnvironment>> {
-        let mut turn_environments = Vec::with_capacity(environments.len());
-        for selected_environment in environments {
-            let environment_id = selected_environment.environment_id.clone();
-            let environment = self
-                .services
-                .environment_manager
-                .get_environment(&environment_id)
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "unknown turn environment id `{environment_id}`"
-                    ))
-                })?;
-            let cwd = selected_environment.cwd.clone();
-            turn_environments.push(TurnEnvironment {
-                environment_id,
-                environment,
-                cwd,
-            });
-        }
-
-        Ok(turn_environments)
+    ) -> CodexResult<ResolvedTurnEnvironments> {
+        crate::environment_selection::resolve_environment_selections(
+            self.services.environment_manager.as_ref(),
+            environments,
+        )
     }
 
     async fn new_turn_from_configuration(
@@ -648,11 +679,9 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
-        turn_environments: Vec<TurnEnvironment>,
+        turn_environments: ResolvedTurnEnvironments,
     ) -> Arc<TurnContext> {
-        let primary_turn_environment = turn_environments.first();
-        let environment = primary_turn_environment
-            .map(|turn_environment| Arc::clone(&turn_environment.environment));
+        let primary_turn_environment = turn_environments.primary();
         let cwd = primary_turn_environment
             .map(|turn_environment| turn_environment.cwd.clone())
             .unwrap_or_else(|| session_configuration.cwd.clone());
@@ -675,13 +704,12 @@ impl Session {
         let plugin_outcome = self
             .services
             .plugins_manager
-            .plugins_for_config(&per_turn_config)
+            .plugins_for_config(&per_turn_config.plugins_config_input())
             .await;
-        let effective_skill_roots = plugin_outcome.effective_skill_roots();
+        let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
         let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots);
-        let fs = environment
-            .as_ref()
-            .map(|environment| environment.get_filesystem());
+        let fs = primary_turn_environment
+            .map(|turn_environment| turn_environment.environment.get_filesystem());
         let skills_outcome = Arc::new(
             self.services
                 .skills_manager
@@ -710,7 +738,6 @@ impl Session {
                     )
                     .then(|| started_proxy.proxy())
                 }),
-            environment,
             turn_environments,
             cwd,
             sub_id,
@@ -752,14 +779,18 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.clone()
         };
-        let turn_environments =
-            match self.resolve_turn_environments(&session_configuration.environments) {
-                Ok(turn_environments) => turn_environments,
-                Err(err) => {
-                    warn!("failed to resolve stored session environments: {err}");
-                    Vec::new()
-                }
-            };
+        let mut effective_environments = session_configuration.environments.clone();
+        Self::overlay_runtime_cwd_on_primary_environment(
+            &mut effective_environments,
+            &session_configuration.cwd,
+        );
+        let turn_environments = match self.resolve_turn_environments(&effective_environments) {
+            Ok(turn_environments) => turn_environments,
+            Err(err) => {
+                warn!("failed to resolve stored session environments: {err}");
+                ResolvedTurnEnvironments::default()
+            }
+        };
 
         self.new_turn_from_configuration(
             sub_id,
@@ -768,5 +799,16 @@ impl Session {
             turn_environments,
         )
         .await
+    }
+
+    fn overlay_runtime_cwd_on_primary_environment(
+        environments: &mut [TurnEnvironmentSelection],
+        runtime_cwd: &AbsolutePathBuf,
+    ) {
+        if let Some(turn_environment) = environments.first_mut()
+            && turn_environment.cwd != *runtime_cwd
+        {
+            turn_environment.cwd = runtime_cwd.clone();
+        }
     }
 }

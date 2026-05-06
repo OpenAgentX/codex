@@ -722,6 +722,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -764,6 +765,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -900,6 +902,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             source,
+            thread_source: None,
             git_info: None,
             name: None,
             turns: Vec::new(),
