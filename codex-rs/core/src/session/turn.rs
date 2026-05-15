@@ -44,20 +44,22 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::HandleOutputCtx;
+use crate::stream_events_utils::TurnItemContributorPolicy;
+use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
-use crate::stream_events_utils::record_completed_response_item;
+use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolRouterParams;
+use crate::tools::router::extension_tool_executors;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::record_turn_ttft_metric;
-use crate::unavailable_tool::collect_unavailable_called_tools;
 use crate::util::backoff;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
@@ -68,11 +70,13 @@ use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
 use codex_features::Feature;
+use codex_git_utils::get_git_repo_root;
 use codex_hooks::HookEvent;
 use codex_hooks::HookEventAfterAgent;
 use codex_hooks::HookPayload;
 use codex_hooks::HookResult;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::PlanItem;
@@ -137,6 +141,7 @@ use tracing::warn;
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    turn_extension_data: Arc<codex_extension_api::ExtensionData>,
     input: Vec<UserInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
@@ -194,10 +199,10 @@ pub(crate) async fn run_turn(
         {
             Ok(mcp_tools) => mcp_tools,
             Err(_) if turn_context.apps_enabled() => return None,
-            Err(_) => HashMap::new(),
+            Err(_) => Vec::new(),
         }
     } else {
-        HashMap::new()
+        Vec::new()
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
@@ -239,6 +244,7 @@ pub(crate) async fn run_turn(
         turn_context.as_ref(),
         &cancellation_token,
         &mentioned_skills,
+        Some(sess.mcp_elicitation_reviewer()),
     )
     .await;
 
@@ -363,7 +369,12 @@ pub(crate) async fn run_turn(
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
-    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    #[allow(deprecated)]
+    let display_root = get_git_repo_root(turn_context.cwd.as_path())
+        .unwrap_or_else(|| turn_context.cwd.clone().into_path_buf());
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::with_display_root(
+        display_root,
+    )));
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -446,6 +457,7 @@ pub(crate) async fn run_turn(
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
+            Arc::clone(&turn_extension_data),
             Arc::clone(&turn_diff_tracker),
             &mut client_session,
             turn_metadata_header.as_deref(),
@@ -515,8 +527,9 @@ pub(crate) async fn run_turn(
                     }
                     .to_string();
                     let stop_request = codex_hooks::StopRequest {
-                        session_id: sess.conversation_id,
+                        session_id: sess.session_id().into(),
                         turn_id: turn_context.sub_id.clone(),
+                        #[allow(deprecated)]
                         cwd: turn_context.cwd.clone(),
                         transcript_path: sess.hook_transcript_path().await,
                         model: turn_context.model_info.slug.clone(),
@@ -565,7 +578,8 @@ pub(crate) async fn run_turn(
                     let hook_outcomes = sess
                         .hooks()
                         .dispatch(HookPayload {
-                            session_id: sess.conversation_id,
+                            session_id: sess.session_id().into(),
+                            #[allow(deprecated)]
                             cwd: turn_context.cwd.clone(),
                             client: turn_context.app_server_client_name.clone(),
                             triggered_at: chrono::Utc::now(),
@@ -690,10 +704,15 @@ async fn track_turn_resolved_config_analytics(
             model: turn_context.model_info.slug.clone(),
             model_provider: turn_context.config.model_provider_id.clone(),
             permission_profile: turn_context.permission_profile(),
+            #[allow(deprecated)]
             permission_profile_cwd: turn_context.cwd.to_path_buf(),
             reasoning_effort: turn_context.reasoning_effort,
             reasoning_summary: Some(turn_context.reasoning_summary),
-            service_tier: turn_context.config.service_tier,
+            service_tier: turn_context
+                .config
+                .service_tier
+                .as_deref()
+                .and_then(ServiceTier::from_request_value),
             approval_policy: turn_context.approval_policy.value(),
             approvals_reviewer: turn_context.config.approvals_reviewer,
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
@@ -982,6 +1001,7 @@ pub(crate) fn build_prompt(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
 #[instrument(level = "trace",
     skip_all,
     fields(
@@ -993,6 +1013,7 @@ pub(crate) fn build_prompt(
 async fn run_sampling_request(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    turn_store: Arc<codex_extension_api::ExtensionData>,
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
@@ -1049,6 +1070,7 @@ async fn run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
+            Arc::clone(&turn_store),
             client_session,
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
@@ -1233,41 +1255,13 @@ pub(crate) async fn built_tools(
     );
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
-    let unavailable_called_tools = if turn_context
-        .config
-        .features
-        .enabled(Feature::UnavailableDummyTools)
-    {
-        let exposed_tool_names = mcp_tools
-            .iter()
-            .chain(deferred_mcp_tools.iter())
-            .flat_map(|tools| tools.keys().map(String::as_str))
-            .collect::<HashSet<_>>();
-        collect_unavailable_called_tools(input, &exposed_tool_names)
-    } else {
-        Vec::new()
-    };
-
-    let parallel_mcp_server_names = turn_context
-        .config
-        .mcp_servers
-        .get()
-        .iter()
-        .filter_map(|(server_name, server_config)| {
-            server_config
-                .supports_parallel_tool_calls
-                .then_some(server_name.clone())
-        })
-        .collect::<HashSet<_>>();
-
     Ok(Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
         ToolRouterParams {
             mcp_tools,
             deferred_mcp_tools,
-            unavailable_called_tools,
-            parallel_mcp_server_names,
             discoverable_tools,
+            extension_tool_executors: extension_tool_executors(sess),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
         },
     )))
@@ -1504,10 +1498,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::DeprecationNotice(_)
         | EventMsg::StreamError(_)
         | EventMsg::TurnDiff(_)
-        | EventMsg::GetHistoryEntryResponse(_)
-        | EventMsg::McpListToolsResponse(_)
         | EventMsg::RealtimeConversationListVoicesResponse(_)
-        | EventMsg::SkillsUpdateAvailable
         | EventMsg::PlanUpdate(_)
         | EventMsg::TurnAborted(_)
         | EventMsg::ShutdownComplete
@@ -1762,6 +1753,7 @@ async fn emit_turn_item_in_plan_mode(
 async fn handle_assistant_item_done_in_plan_mode(
     sess: &Session,
     turn_context: &TurnContext,
+    turn_store: &codex_extension_api::ExtensionData,
     item: &ResponseItem,
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
@@ -1772,21 +1764,38 @@ async fn handle_assistant_item_done_in_plan_mode(
     {
         maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
 
-        if let Some(turn_item) =
-            handle_non_tool_response_item(sess, turn_context, item, /*plan_mode*/ true).await
+        let mut finalized_facts = None;
+        if let Some(finalized_turn_item) = finalize_non_tool_response_item(
+            sess,
+            turn_context,
+            TurnItemContributorPolicy::Run(turn_store),
+            item,
+            /*plan_mode*/ true,
+        )
+        .await
         {
+            finalized_facts = Some(finalized_turn_item.facts.clone());
             emit_turn_item_in_plan_mode(
                 sess,
                 turn_context,
-                turn_item,
+                finalized_turn_item.turn_item,
                 previously_active_item,
                 state,
             )
             .await;
         }
+        let final_last_agent_message = finalized_facts
+            .as_ref()
+            .and_then(|facts| facts.last_agent_message.clone());
 
-        record_completed_response_item(sess, turn_context, item).await;
-        if let Some(agent_message) = last_assistant_message_from_item(item, /*plan_mode*/ true) {
+        record_completed_response_item_with_finalized_facts(
+            sess,
+            turn_context,
+            item,
+            finalized_facts.as_ref(),
+        )
+        .await;
+        if let Some(agent_message) = final_last_agent_message {
             *last_agent_message = Some(agent_message);
         }
         return true;
@@ -1832,6 +1841,7 @@ async fn try_run_sampling_request(
     tool_runtime: ToolCallRuntime,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    turn_store: Arc<codex_extension_api::ExtensionData>,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
@@ -1858,7 +1868,7 @@ async fn try_run_sampling_request(
             &turn_context.session_telemetry,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
-            turn_context.config.service_tier,
+            turn_context.config.service_tier.clone(),
             turn_metadata_header,
             &inference_trace,
         )
@@ -1875,11 +1885,16 @@ async fn try_run_sampling_request(
         Box<dyn ToolArgumentDiffConsumer>,
     )> = None;
     let mut should_emit_turn_diff = false;
+    let mut should_emit_token_count = false;
     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+    let defer_streamed_turn_items_for_contributors =
+        !sess.services.extensions.turn_item_contributors().is_empty();
+    let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
+    let mut completed_response_id: Option<String> = None;
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
@@ -1930,7 +1945,13 @@ async fn try_run_sampling_request(
                     sess.send_event(&turn_context, event).await;
                 }
                 let previously_active_item = active_item.take();
-                if let Some(previous) = previously_active_item.as_ref()
+                let previously_streamed_item = if active_item_is_streaming_to_client {
+                    previously_active_item
+                } else {
+                    None
+                };
+                active_item_is_streaming_to_client = false;
+                if let Some(previous) = previously_streamed_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
                     let item_id = previous.id();
@@ -1947,9 +1968,10 @@ async fn try_run_sampling_request(
                     && handle_assistant_item_done_in_plan_mode(
                         &sess,
                         &turn_context,
+                        turn_store.as_ref(),
                         &item,
                         state,
-                        previously_active_item.as_ref(),
+                        previously_streamed_item.as_ref(),
                         &mut last_agent_message,
                     )
                     .await
@@ -1960,6 +1982,7 @@ async fn try_run_sampling_request(
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
                     turn_context: turn_context.clone(),
+                    turn_store: Arc::clone(&turn_store),
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
                 };
@@ -1984,7 +2007,7 @@ async fn try_run_sampling_request(
                 };
 
                 let output_result =
-                    match handle_output_item_done(&mut ctx, item, previously_active_item)
+                    match handle_output_item_done(&mut ctx, item, previously_streamed_item)
                         .instrument(handle_responses)
                         .await
                     {
@@ -2018,15 +2041,18 @@ async fn try_run_sampling_request(
                 if let Some(turn_item) = handle_non_tool_response_item(
                     sess.as_ref(),
                     turn_context.as_ref(),
+                    TurnItemContributorPolicy::Skip,
                     &item,
                     plan_mode,
                 )
                 .await
                 {
                     let mut turn_item = turn_item;
+                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
-                    if matches!(turn_item, TurnItem::AgentMessage(_))
+                    if stream_item_to_client
+                        && matches!(turn_item, TurnItem::AgentMessage(_))
                         && let Some(raw_text) = raw_assistant_output_text_from_item(&item)
                     {
                         let item_id = turn_item.id();
@@ -2045,31 +2071,34 @@ async fn try_run_sampling_request(
                         seeded_parsed = plan_mode.then_some(seeded);
                         seeded_item_id = Some(item_id);
                     }
-                    if let Some(state) = plan_mode_state.as_mut()
-                        && matches!(turn_item, TurnItem::AgentMessage(_))
-                    {
-                        let item_id = turn_item.id();
-                        state
-                            .pending_agent_message_items
-                            .insert(item_id, turn_item.clone());
-                    } else {
-                        sess.emit_turn_item_started(&turn_context, &turn_item).await;
-                    }
-                    if let (Some(state), Some(item_id), Some(parsed)) = (
-                        plan_mode_state.as_mut(),
-                        seeded_item_id.as_deref(),
-                        seeded_parsed,
-                    ) {
-                        emit_streamed_assistant_text_delta(
-                            &sess,
-                            &turn_context,
-                            Some(state),
-                            item_id,
-                            parsed,
-                        )
-                        .await;
+                    if stream_item_to_client {
+                        if let Some(state) = plan_mode_state.as_mut()
+                            && matches!(turn_item, TurnItem::AgentMessage(_))
+                        {
+                            let item_id = turn_item.id();
+                            state
+                                .pending_agent_message_items
+                                .insert(item_id, turn_item.clone());
+                        } else {
+                            sess.emit_turn_item_started(&turn_context, &turn_item).await;
+                        }
+                        if let (Some(state), Some(item_id), Some(parsed)) = (
+                            plan_mode_state.as_mut(),
+                            seeded_item_id.as_deref(),
+                            seeded_parsed,
+                        ) {
+                            emit_streamed_assistant_text_delta(
+                                &sess,
+                                &turn_context,
+                                Some(state),
+                                item_id,
+                                parsed,
+                            )
+                            .await;
+                        }
                     }
                     active_item = Some(turn_item);
+                    active_item_is_streaming_to_client = stream_item_to_client;
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
@@ -2100,14 +2129,15 @@ async fn try_run_sampling_request(
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
-                sess.update_rate_limits(&turn_context, snapshot).await;
+                sess.record_rate_limits_info(snapshot).await;
+                should_emit_token_count = true;
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
                 sess.services.models_manager.refresh_if_new_etag(etag).await;
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id,
                 token_usage,
                 end_turn,
             } => {
@@ -2118,12 +2148,14 @@ async fn try_run_sampling_request(
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
-                sess.update_token_usage_info(&turn_context, token_usage.as_ref())
+                sess.record_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
+                should_emit_token_count = true;
                 should_emit_turn_diff = true;
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
+                completed_response_id = Some(response_id);
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
@@ -2133,6 +2165,9 @@ async fn try_run_sampling_request(
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
                 if let Some(active) = active_item.as_ref() {
+                    if !active_item_is_streaming_to_client {
+                        continue;
+                    }
                     let item_id = active.id();
                     if matches!(active, TurnItem::AgentMessage(_)) {
                         let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
@@ -2181,6 +2216,9 @@ async fn try_run_sampling_request(
                 summary_index,
             } => {
                 if let Some(active) = active_item.as_ref() {
+                    if !active_item_is_streaming_to_client {
+                        continue;
+                    }
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -2196,6 +2234,9 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
                 if let Some(active) = active_item.as_ref() {
+                    if !active_item_is_streaming_to_client {
+                        continue;
+                    }
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                             item_id: active.id(),
@@ -2211,6 +2252,9 @@ async fn try_run_sampling_request(
                 content_index,
             } => {
                 if let Some(active) = active_item.as_ref() {
+                    if !active_item_is_streaming_to_client {
+                        continue;
+                    }
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -2235,7 +2279,24 @@ async fn try_run_sampling_request(
     )
     .await;
 
+    if sess
+        .features
+        .enabled(Feature::ResponsesWebsocketResponseProcessed)
+        && outcome.is_ok()
+        && let Some(response_id) = completed_response_id.as_deref()
+    {
+        client_session.send_response_processed(response_id).await;
+    }
+
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+
+    if should_emit_token_count {
+        // A tool call such as request_user_input can intentionally pause the turn. Emit token
+        // counts only after pending tools resolve so clients do not see progress events while the
+        // turn is waiting on the user. This also needs to happen before returning cancellation so
+        // token usage already recorded from the completed response is still persisted.
+        sess.send_token_count_event(&turn_context).await;
+    }
 
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
@@ -2243,10 +2304,10 @@ async fn try_run_sampling_request(
 
     if should_emit_turn_diff {
         let unified_diff = {
-            let mut tracker = turn_diff_tracker.lock().await;
+            let tracker = turn_diff_tracker.lock().await;
             tracker.get_unified_diff()
         };
-        if let Ok(Some(unified_diff)) = unified_diff {
+        if let Some(unified_diff) = unified_diff {
             let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
             sess.clone().send_event(&turn_context, msg).await;
         }
@@ -2263,3 +2324,7 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
     }
     None
 }
+
+#[cfg(test)]
+#[path = "turn_tests.rs"]
+mod tests;

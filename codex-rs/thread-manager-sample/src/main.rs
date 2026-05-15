@@ -20,7 +20,6 @@ use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
 use codex_core_api::Constrained;
 use codex_core_api::EnvironmentManager;
-use codex_core_api::EnvironmentManagerArgs;
 use codex_core_api::EventMsg;
 use codex_core_api::ExecServerRuntimePaths;
 use codex_core_api::Features;
@@ -49,15 +48,17 @@ use codex_core_api::ThreadStoreConfig;
 use codex_core_api::ToolSuggestConfig;
 use codex_core_api::TuiKeymap;
 use codex_core_api::TuiNotificationSettings;
+use codex_core_api::TuiPetAnchor;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
-use codex_core_api::agent_graph_store_from_state_db;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::built_in_model_providers;
+use codex_core_api::empty_extension_registry;
 use codex_core_api::find_codex_home;
-use codex_core_api::init_state_db_from_config;
+use codex_core_api::init_state_db;
 use codex_core_api::item_event_to_server_notification;
+use codex_core_api::resolve_installation_id;
 use codex_core_api::set_default_originator;
 use codex_core_api::thread_store_from_config;
 
@@ -105,6 +106,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     };
 
     let config = new_config(args.model, arg0_paths)?;
+    let state_db = init_state_db(&config).await;
 
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
@@ -112,22 +114,22 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
-    let Some(state_db) = init_state_db_from_config(&config).await else {
-        bail!("thread manager sample requires state db");
-    };
     let thread_store = thread_store_from_config(&config, state_db.clone());
-    let agent_graph_store = agent_graph_store_from_state_db(state_db.clone());
-    let environment_manager =
-        Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::new(local_runtime_paths)).await);
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), local_runtime_paths).await?,
+    );
+    let installation_id = resolve_installation_id(&config.codex_home).await?;
     let thread_manager = ThreadManager::new(
         &config,
         auth_manager,
         SessionSource::Exec,
         environment_manager,
+        empty_extension_registry(),
         /*analytics_events_client*/ None,
-        state_db,
         Arc::clone(&thread_store),
-        agent_graph_store,
+        state_db,
+        installation_id,
+        /*attestation_provider*/ None,
     );
 
     let NewThread {
@@ -161,6 +163,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
     let mut config = Config {
         config_layer_stack: ConfigLayerStack::default(),
         startup_warnings: Vec::new(),
+        bypass_hook_trust: false,
         model,
         service_tier: None,
         review_model: None,
@@ -189,10 +192,10 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         guardian_policy_config: None,
         include_permissions_instructions: false,
         include_apps_instructions: false,
+        include_collaboration_mode_instructions: false,
         include_skill_instructions: false,
         include_environment_context: false,
         compact_prompt: None,
-        commit_attribution: None,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,
@@ -204,6 +207,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_terminal_title: None,
         tui_theme: None,
         tui_raw_output_mode: false,
+        tui_pet: None,
+        tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         tui_keymap: TuiKeymap::default(),
         tui_session_picker_view: SessionPickerViewMode::Dense,
@@ -257,7 +262,6 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         experimental_thread_store: ThreadStoreConfig::Local,
         forced_chatgpt_workspace_id: None,
         forced_login_method: None,
-        include_apply_patch_tool: false,
         web_search_mode: Constrained::allow_any(WebSearchMode::Disabled),
         web_search_config: None,
         use_experimental_unified_exec_tool: false,
@@ -268,7 +272,6 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         suppress_unstable_features_warning: false,
         active_profile: None,
         active_project: ProjectConfig { trust_level: None },
-        windows_wsl_setup_acknowledged: false,
         notices: Notice::default(),
         check_for_update_on_startup: false,
         disable_paste_burst: false,

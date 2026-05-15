@@ -4,14 +4,16 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
 use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 
 use super::DEFAULT_WAIT_YIELD_TIME_MS;
 use super::ExecContext;
 use super::WAIT_TOOL_NAME;
 use super::handle_runtime_response;
+use super::wait_spec::create_wait_tool;
 
 pub struct CodeModeWaitHandler;
 
@@ -39,15 +41,16 @@ where
     })
 }
 
-impl ToolHandler for CodeModeWaitHandler {
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
     type Output = FunctionToolOutput;
 
     fn tool_name(&self) -> ToolName {
         ToolName::plain(WAIT_TOOL_NAME)
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_wait_tool())
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
@@ -104,3 +107,5 @@ impl ToolHandler for CodeModeWaitHandler {
         }
     }
 }
+
+impl ToolHandler for CodeModeWaitHandler {}
