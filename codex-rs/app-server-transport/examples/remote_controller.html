@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Remote Controller</title>
+  <style>
+    :root {
+      --bg: #0c1117;
+      --panel: #15202b;
+      --panel-2: #1e2c39;
+      --border: #2b3d4d;
+      --text: #e6edf3;
+      --muted: #91a1b2;
+      --accent: #67e8f9;
+      --danger: #f87171;
+      --ok: #34d399;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background:
+        radial-gradient(circle at top left, rgba(103, 232, 249, 0.10), transparent 22%),
+        linear-gradient(180deg, #091018, #0c1117 30%, #0b131c);
+    }
+    h1, h2 {
+      margin: 0 0 12px;
+      letter-spacing: 0.02em;
+    }
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      align-items: start;
+    }
+    .panel {
+      background: rgba(21, 32, 43, 0.94);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.22);
+    }
+    label {
+      display: block;
+      margin: 10px 0 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    input, textarea, button {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea {
+      min-height: 140px;
+      resize: vertical;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button.primary {
+      border-color: #155e75;
+      background: linear-gradient(180deg, #0f766e, #155e75);
+    }
+    button.warn {
+      border-color: #991b1b;
+      background: linear-gradient(180deg, #7f1d1d, #991b1b);
+    }
+    .row {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      margin-top: 12px;
+    }
+    .status {
+      min-height: 44px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0e1720;
+      padding: 10px 12px;
+      color: var(--accent);
+      white-space: pre-wrap;
+    }
+    .danger {
+      color: var(--danger);
+    }
+    .ok {
+      color: var(--ok);
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <h1>Codex Remote Controller</h1>
+  <p>This controller talks to the local Rust remote backend. The backend bridges browser commands to Codex remote-control websocket envelopes, handles chunking/reassembly, and routes replies back to the right controller session.</p>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Connection</h2>
+      <label for="backendOrigin">Backend Origin</label>
+      <input id="backendOrigin" value="">
+
+      <label for="environmentId">Environment ID</label>
+      <input id="environmentId" placeholder="Select an environment from /environments">
+
+      <div class="row">
+        <button id="listEnvironments">List Environments</button>
+        <button id="connectController" class="primary">Connect Controller</button>
+      </div>
+
+      <label>Status</label>
+      <div id="statusBox" class="status">disconnected</div>
+
+      <label>Environments</label>
+      <pre id="environmentList">[]</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Session</h2>
+      <label for="clientName">Client Name</label>
+      <input id="clientName" value="remote-controller-demo">
+
+      <label for="clientVersion">Client Version</label>
+      <input id="clientVersion" value="0.2.0">
+
+      <label for="threadId">Thread ID</label>
+      <input id="threadId" placeholder="auto-filled from thread/start or notifications">
+
+      <label for="turnId">Turn ID</label>
+      <input id="turnId" placeholder="auto-filled from turn/start or notifications">
+
+      <label for="cwd">CWD Override</label>
+      <input id="cwd" placeholder="optional absolute path">
+
+      <label for="model">Model Override</label>
+      <input id="model" placeholder="optional, e.g. gpt-5.5">
+
+      <div class="row">
+        <button id="sendInitialize" class="primary">Send initialize</button>
+        <button id="sendInitialized">Send initialized</button>
+        <button id="sendPing">Ping</button>
+        <button id="sendClose" class="warn">Close Session</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Turn Controls</h2>
+      <label for="promptText">Prompt Text</label>
+      <textarea id="promptText">Explain the current workspace briefly.</textarea>
+
+      <div class="row">
+        <button id="sendThreadStart" class="primary">thread/start</button>
+        <button id="sendTurnStart" class="primary">turn/start</button>
+        <button id="sendTurnInterrupt" class="warn">turn/interrupt</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Raw JSON-RPC</h2>
+      <label for="rpcPayload">Raw Message</label>
+      <textarea id="rpcPayload">{
+  "jsonrpc": "2.0",
+  "id": 99,
+  "method": "app/list",
+  "params": {}
+}</textarea>
+
+      <div class="row">
+        <button id="sendRpc" class="primary">Send Raw RPC</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>State</h2>
+      <pre id="stateBox">{
+  "clientId": null,
+  "streamId": null,
+  "threadId": null,
+  "turnId": null,
+  "nextRequestId": 2
+}</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Event Log</h2>
+      <pre id="eventLog"></pre>
+    </section>
+  </div>
+
+  <script>
+    const backendOrigin = document.getElementById("backendOrigin");
+    const environmentId = document.getElementById("environmentId");
+    const environmentList = document.getElementById("environmentList");
+    const statusBox = document.getElementById("statusBox");
+    const eventLog = document.getElementById("eventLog");
+    const stateBox = document.getElementById("stateBox");
+    const clientName = document.getElementById("clientName");
+    const clientVersion = document.getElementById("clientVersion");
+    const threadId = document.getElementById("threadId");
+    const turnId = document.getElementById("turnId");
+    const cwd = document.getElementById("cwd");
+    const model = document.getElementById("model");
+    const promptText = document.getElementById("promptText");
+    const rpcPayload = document.getElementById("rpcPayload");
+
+    backendOrigin.value = `${window.location.protocol}//${window.location.host}`;
+
+    const uiState = {
+      clientId: null,
+      streamId: null,
+      threadId: null,
+      turnId: null,
+      nextRequestId: 2
+    };
+
+    let socket = null;
+
+    function renderState() {
+      uiState.threadId = threadId.value.trim() || null;
+      uiState.turnId = turnId.value.trim() || null;
+      stateBox.textContent = JSON.stringify(uiState, null, 2);
+    }
+
+    function log(label, payload) {
+      const line = `[${new Date().toLocaleTimeString()}] ${label}\n${typeof payload === "string" ? payload : JSON.stringify(payload, null, 2)}\n\n`;
+      eventLog.textContent = line + eventLog.textContent;
+    }
+
+    function setStatus(text, isError = false) {
+      statusBox.textContent = text;
+      statusBox.classList.toggle("danger", isError);
+    }
+
+    function nextRequestId() {
+      return uiState.nextRequestId++;
+    }
+
+    async function listEnvironments() {
+      const response = await fetch(`${backendOrigin.value}/environments`);
+      const data = await response.json();
+      environmentList.textContent = JSON.stringify(data, null, 2);
+      if (data.length > 0 && !environmentId.value.trim()) {
+        environmentId.value = data[0].environmentId;
+      }
+      return data;
+    }
+
+    function controllerWsUrl() {
+      const origin = new URL(backendOrigin.value);
+      origin.protocol = origin.protocol === "https:" ? "wss:" : "ws:";
+      origin.pathname = `/controller/ws/${encodeURIComponent(environmentId.value.trim())}`;
+      origin.search = "";
+      return origin.toString();
+    }
+
+    function connectController() {
+      if (!environmentId.value.trim()) {
+        setStatus("environmentId is required", true);
+        return;
+      }
+      if (socket) {
+        socket.close();
+      }
+
+      socket = new WebSocket(controllerWsUrl());
+      setStatus("connecting...");
+
+      socket.onopen = () => {
+        setStatus("controller websocket connected");
+        log("controller/open", controllerWsUrl());
+      };
+
+      socket.onmessage = (event) => {
+        const payload = JSON.parse(event.data);
+        log("controller/message", payload);
+        handleControllerEvent(payload);
+      };
+
+      socket.onerror = () => {
+        setStatus("controller websocket error", true);
+      };
+
+      socket.onclose = () => {
+        setStatus("controller websocket closed");
+      };
+    }
+
+    function sendCommand(command) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setStatus("controller websocket is not connected", true);
+        return;
+      }
+      socket.send(JSON.stringify(command));
+      log("controller/send", command);
+    }
+
+    function handleControllerEvent(payload) {
+      if (payload.type === "hello") {
+        uiState.clientId = payload.clientId;
+        uiState.streamId = payload.streamId;
+        setStatus(`connected to ${payload.environmentId}\nclientId=${payload.clientId}\nstreamId=${payload.streamId}`);
+        renderState();
+        return;
+      }
+      if (payload.type === "status") {
+        setStatus(`codexConnected=${payload.codexConnected}\ncontrollers=${payload.controllerCount}`);
+        return;
+      }
+      if (payload.type === "error") {
+        setStatus(payload.message, true);
+        return;
+      }
+      if (payload.type === "codexEnvelope") {
+        handleCodexEnvelope(payload.envelope);
+      }
+    }
+
+    function handleCodexEnvelope(envelope) {
+      const event = envelope.event;
+      if (!event || event.type !== "server_message") {
+        return;
+      }
+      const message = event.message;
+      if (!message || typeof message !== "object") {
+        return;
+      }
+
+      if (message.result?.thread?.id) {
+        threadId.value = message.result.thread.id;
+      }
+      if (message.result?.turn?.id) {
+        turnId.value = message.result.turn.id;
+      }
+      if (message.method === "thread/started" && message.params?.thread?.id) {
+        threadId.value = message.params.thread.id;
+      }
+      if ((message.method === "turn/started" || message.method === "turn/completed") && message.params?.turn?.id) {
+        threadId.value = message.params.threadId || threadId.value;
+        turnId.value = message.params.turn.id;
+      }
+      renderState();
+    }
+
+    function maybeSet(object, key, value) {
+      if (value) {
+        object[key] = value;
+      }
+    }
+
+    function buildThreadStartMessage() {
+      const params = {};
+      maybeSet(params, "cwd", cwd.value.trim());
+      maybeSet(params, "model", model.value.trim());
+      return {
+        jsonrpc: "2.0",
+        id: nextRequestId(),
+        method: "thread/start",
+        params
+      };
+    }
+
+    function buildTurnStartMessage() {
+      const currentThreadId = threadId.value.trim();
+      if (!currentThreadId) {
+        throw new Error("threadId is required for turn/start");
+      }
+      const params = {
+        threadId: currentThreadId,
+        input: [
+          {
+            type: "text",
+            text: promptText.value,
+            textElements: []
+          }
+        ]
+      };
+      maybeSet(params, "cwd", cwd.value.trim());
+      maybeSet(params, "model", model.value.trim());
+      return {
+        jsonrpc: "2.0",
+        id: nextRequestId(),
+        method: "turn/start",
+        params
+      };
+    }
+
+    function buildTurnInterruptMessage() {
+      const currentThreadId = threadId.value.trim();
+      const currentTurnId = turnId.value.trim();
+      if (!currentThreadId || !currentTurnId) {
+        throw new Error("threadId and turnId are required for turn/interrupt");
+      }
+      return {
+        jsonrpc: "2.0",
+        id: nextRequestId(),
+        method: "turn/interrupt",
+        params: {
+          threadId: currentThreadId,
+          turnId: currentTurnId
+        }
+      };
+    }
+
+    document.getElementById("listEnvironments").addEventListener("click", () => {
+      listEnvironments().catch((err) => setStatus(`list failed: ${err}`, true));
+    });
+
+    document.getElementById("connectController").addEventListener("click", connectController);
+
+    document.getElementById("sendInitialize").addEventListener("click", () => {
+      sendCommand({
+        type: "initialize",
+        requestId: 1,
+        clientName: clientName.value.trim() || "remote-controller-demo",
+        clientVersion: clientVersion.value.trim() || "0.2.0",
+        experimentalApi: true,
+        requestAttestation: false
+      });
+    });
+
+    document.getElementById("sendInitialized").addEventListener("click", () => {
+      sendCommand({ type: "initialized" });
+    });
+
+    document.getElementById("sendPing").addEventListener("click", () => {
+      sendCommand({ type: "ping" });
+    });
+
+    document.getElementById("sendClose").addEventListener("click", () => {
+      sendCommand({ type: "close" });
+    });
+
+    document.getElementById("sendThreadStart").addEventListener("click", () => {
+      try {
+        sendCommand({ type: "rpc", message: buildThreadStartMessage() });
+        renderState();
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    });
+
+    document.getElementById("sendTurnStart").addEventListener("click", () => {
+      try {
+        sendCommand({ type: "rpc", message: buildTurnStartMessage() });
+        renderState();
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    });
+
+    document.getElementById("sendTurnInterrupt").addEventListener("click", () => {
+      try {
+        sendCommand({ type: "rpc", message: buildTurnInterruptMessage() });
+        renderState();
+      } catch (err) {
+        setStatus(String(err), true);
+      }
+    });
+
+    document.getElementById("sendRpc").addEventListener("click", () => {
+      try {
+        const message = JSON.parse(rpcPayload.value);
+        sendCommand({ type: "rpc", message });
+      } catch (err) {
+        setStatus(`invalid raw JSON-RPC payload: ${err}`, true);
+      }
+    });
+
+    threadId.addEventListener("input", renderState);
+    turnId.addEventListener("input", renderState);
+
+    renderState();
+    listEnvironments().catch(() => {});
+  </script>
+</body>
+</html>
