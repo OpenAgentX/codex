@@ -64,6 +64,7 @@ fn resume_history(
                 images: None,
                 local_images: vec![],
                 text_elements: vec![],
+                ..Default::default()
             })),
             RolloutItem::TurnContext(turn_ctx),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -105,7 +106,7 @@ async fn emits_warning_when_resumed_model_differs() {
         ..
     } = thread_manager
         .resume_thread_with_history(
-            config,
+            config.clone(),
             initial_history,
             auth_manager,
             /*persist_extended_history*/ false,

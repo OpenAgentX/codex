@@ -7,13 +7,15 @@
 use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
+use http::HeaderMap;
+use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
@@ -23,7 +25,7 @@ use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
 
-static NEXT_INFERENCE_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+const INFERENCE_CALL_ID_HEADER: &str = "x-codex-inference-call-id";
 
 /// Turn-local inference tracing context.
 ///
@@ -84,6 +86,7 @@ struct EnabledInferenceTraceAttempt {
 #[derive(Serialize)]
 struct TracedResponseStreamOutput<'a> {
     response_id: Option<&'a str>,
+    upstream_request_id: Option<&'a str>,
     token_usage: Option<&'a TokenUsage>,
     output_items: Vec<JsonValue>,
 }
@@ -139,6 +142,30 @@ impl InferenceTraceAttempt {
         }
     }
 
+    fn inference_call_id(&self) -> Option<&str> {
+        match &self.state {
+            InferenceTraceAttemptState::Disabled => None,
+            InferenceTraceAttemptState::Enabled(attempt) => {
+                Some(attempt.inference_call_id.as_str())
+            }
+        }
+    }
+
+    /// Adds rollout-trace propagation headers for this attempt when tracing is enabled.
+    pub fn add_request_headers(&self, headers: &mut HeaderMap) {
+        let Some(inference_call_id) = self.inference_call_id() else {
+            return;
+        };
+        let Ok(inference_call_id) = HeaderValue::from_str(inference_call_id) else {
+            // These IDs are generated internally as UUID strings, so rejection
+            // should be impossible in practice. Tracing remains best-effort,
+            // though, and must never make provider requests fail.
+            return;
+        };
+
+        headers.insert(INFERENCE_CALL_ID_HEADER, inference_call_id);
+    }
+
     /// Records the exact request object about to be sent to the model provider.
     pub fn record_started(&self, request: &impl Serialize) {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
@@ -174,6 +201,7 @@ impl InferenceTraceAttempt {
     pub fn record_completed(
         &self,
         response_id: &str,
+        upstream_request_id: Option<&str>,
         token_usage: &Option<TokenUsage>,
         output_items: &[ResponseItem],
     ) {
@@ -183,6 +211,7 @@ impl InferenceTraceAttempt {
         let Some(response_payload) = write_response_payload_best_effort(
             attempt,
             Some(response_id),
+            upstream_request_id,
             token_usage.as_ref(),
             output_items,
         ) else {
@@ -194,13 +223,19 @@ impl InferenceTraceAttempt {
             RawTraceEventPayload::InferenceCompleted {
                 inference_call_id: attempt.inference_call_id.clone(),
                 response_id: Some(response_id.to_string()),
+                upstream_request_id: upstream_request_id.map(str::to_string),
                 response_payload,
             },
         );
     }
 
     /// Records pre-response and mid-stream failures.
-    pub fn record_failed(&self, error: impl Display, output_items: &[ResponseItem]) {
+    pub fn record_failed(
+        &self,
+        error: impl Display,
+        upstream_request_id: Option<&str>,
+        output_items: &[ResponseItem],
+    ) {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
@@ -210,6 +245,7 @@ impl InferenceTraceAttempt {
             write_response_payload_best_effort(
                 attempt,
                 /*response_id*/ None,
+                upstream_request_id,
                 /*token_usage*/ None,
                 output_items,
             )
@@ -218,6 +254,7 @@ impl InferenceTraceAttempt {
             &attempt.context,
             RawTraceEventPayload::InferenceFailed {
                 inference_call_id: attempt.inference_call_id.clone(),
+                upstream_request_id: upstream_request_id.map(str::to_string),
                 error: error.to_string(),
                 partial_response_payload,
             },
@@ -229,7 +266,12 @@ impl InferenceTraceAttempt {
     /// This happens when the turn is interrupted or when mailbox delivery
     /// preempts the current sampling request. Complete output items observed
     /// before that point are retained as partial response evidence.
-    pub fn record_cancelled(&self, reason: impl Display, output_items: &[ResponseItem]) {
+    pub fn record_cancelled(
+        &self,
+        reason: impl Display,
+        upstream_request_id: Option<&str>,
+        output_items: &[ResponseItem],
+    ) {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
@@ -239,6 +281,7 @@ impl InferenceTraceAttempt {
             write_response_payload_best_effort(
                 attempt,
                 /*response_id*/ None,
+                upstream_request_id,
                 /*token_usage*/ None,
                 output_items,
             )
@@ -247,6 +290,7 @@ impl InferenceTraceAttempt {
             &attempt.context,
             RawTraceEventPayload::InferenceCancelled {
                 inference_call_id: attempt.inference_call_id.clone(),
+                upstream_request_id: upstream_request_id.map(str::to_string),
                 reason: reason.to_string(),
                 partial_response_payload,
             },
@@ -297,8 +341,7 @@ pub(crate) fn trace_response_item_json(item: &ResponseItem) -> JsonValue {
 }
 
 fn next_inference_call_id() -> InferenceCallId {
-    let ordinal = NEXT_INFERENCE_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    format!("inference:{ordinal}")
+    Uuid::new_v4().to_string()
 }
 
 fn write_json_payload_best_effort(
@@ -312,11 +355,13 @@ fn write_json_payload_best_effort(
 fn write_response_payload_best_effort(
     attempt: &EnabledInferenceTraceAttempt,
     response_id: Option<&str>,
+    upstream_request_id: Option<&str>,
     token_usage: Option<&TokenUsage>,
     output_items: &[ResponseItem],
 ) -> Option<crate::RawPayloadRef> {
     let response_payload = TracedResponseStreamOutput {
         response_id,
+        upstream_request_id,
         token_usage,
         output_items: output_items.iter().map(trace_response_item_json).collect(),
     };
@@ -353,6 +398,44 @@ mod tests {
     use crate::replay_bundle;
 
     #[test]
+    fn disabled_attempt_adds_no_request_headers() {
+        let mut headers = HeaderMap::new();
+
+        InferenceTraceAttempt::disabled().add_request_headers(&mut headers);
+
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = Arc::new(TraceWriter::create(
+            temp.path(),
+            "trace-1".to_string(),
+            "rollout-1".to_string(),
+            "thread-root".to_string(),
+        )?);
+        let context = InferenceTraceContext::enabled(
+            writer,
+            "thread-root".to_string(),
+            "turn-1".to_string(),
+            "gpt-test".to_string(),
+            "test-provider".to_string(),
+        );
+        let attempt = context.start_attempt();
+        let mut headers = HeaderMap::new();
+
+        attempt.add_request_headers(&mut headers);
+
+        let header = headers
+            .get(INFERENCE_CALL_ID_HEADER)
+            .expect("inference header present");
+        assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
+        assert!(Uuid::parse_str(header.to_str()?).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let writer = Arc::new(TraceWriter::create(
@@ -387,7 +470,7 @@ mod tests {
                 "content": [{"type": "input_text", "text": "hello"}]
             }],
         }));
-        attempt.record_completed("resp-1", &None, &[]);
+        attempt.record_completed("resp-1", Some("req-1"), &None, &[]);
 
         let rollout = replay_bundle(temp.path())?;
         let inference = rollout
@@ -400,7 +483,7 @@ mod tests {
         assert_eq!(inference.thread_id, "thread-root");
         assert_eq!(inference.codex_turn_id, "turn-1");
         assert_eq!(inference.execution.status, ExecutionStatus::Completed);
-        assert_eq!(inference.upstream_request_id, Some("resp-1".to_string()));
+        assert_eq!(inference.upstream_request_id, Some("req-1".to_string()));
         assert_eq!(rollout.raw_payloads.len(), 2);
 
         Ok(())

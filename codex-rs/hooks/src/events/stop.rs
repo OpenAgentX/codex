@@ -259,6 +259,7 @@ fn parse_completed(
             block_reason,
             continuation_fragments,
         },
+        completion_order: 0,
     }
 }
 
@@ -523,7 +524,6 @@ mod tests {
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::Stop,
-            is_managed: false,
             matcher: None,
             command: "echo hook".to_string(),
             timeout_sec: 600,
@@ -531,6 +531,7 @@ mod tests {
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
+            env: std::collections::HashMap::new(),
         }
     }
 

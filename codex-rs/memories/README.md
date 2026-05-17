@@ -10,6 +10,8 @@ Runtime orchestration for Phase 1 and Phase 2 still lives in `codex-core` under
 - `codex-rs/memories/read` (`codex-memories-read`) owns the read path:
   memory developer-instruction injection, memory citation parsing, and
   read-usage telemetry classification.
+- `codex-rs/memories/mcp` (`codex-memories-mcp`) owns the read-only memory
+  filesystem MCP server implementation.
 - `codex-rs/memories/write` (`codex-memories-write`) owns the write path:
   Phase 1 and Phase 2 prompt rendering, filesystem artifact helpers,
   workspace diff helpers, and extension resource pruning.
@@ -94,7 +96,7 @@ What it does:
     `last_usage` / `generated_at`
 - computes a completion watermark from the claimed watermark + newest input timestamps
 - syncs local memory artifacts under the memories root:
-  - `raw_memories.md` (merged raw memories, latest first)
+  - `raw_memories.md` (merged raw memories, stable ascending thread-id order)
   - `rollout_summaries/` (one summary file per selected rollout)
 - keeps the memories root itself as a git-baseline directory, initialized under
   `~/.codex/memories/.git` by `codex-git-utils`
@@ -127,9 +129,10 @@ Selection and workspace-diff behavior:
 - Phase 1 upserts preserve the previous `selected_for_phase2` baseline until
   the next successful Phase 2 run rewrites it
 - Phase 2 loads only the current top-N selected stage-1 inputs, syncs
-  `rollout_summaries/` and `raw_memories.md` directly to that selection, then
-  lets the git-style workspace diff surface additions, modifications, and
-  deletions against the previous successful memory baseline
+  `rollout_summaries/` directly to that selection, renders `raw_memories.md`
+  in stable ascending thread-id order to avoid usage-rank churn, then lets the
+  git-style workspace diff surface additions, modifications, and deletions
+  against the previous successful memory baseline
 - when the selected input set is empty, stale `rollout_summaries/` files are
   removed and `raw_memories.md` is rewritten to the empty-input placeholder;
   consolidated outputs such as `MEMORY.md`, `memory_summary.md`, and `skills/`

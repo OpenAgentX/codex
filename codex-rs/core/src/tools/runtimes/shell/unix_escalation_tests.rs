@@ -28,7 +28,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::GuardianCommandSource;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_sandboxing::SandboxType;
 use codex_shell_escalation::EscalationExecution;
 use codex_shell_escalation::EscalationPermissions;
@@ -38,6 +37,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -64,10 +64,6 @@ fn read_only_file_system_sandbox_policy() -> FileSystemSandboxPolicy {
         },
         access: FileSystemAccessMode::Read,
     }])
-}
-
-fn permission_profile_from_sandbox_policy(sandbox_policy: &SandboxPolicy) -> PermissionProfile {
-    PermissionProfile::from_legacy_sandbox_policy(sandbox_policy)
 }
 
 fn test_sandbox_cwd() -> AbsolutePathBuf {
@@ -324,7 +320,7 @@ fn shell_request_escalation_execution_is_explicit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Result<()> {
-    let (mut session, mut turn_context) = make_session_and_context().await;
+    let (session, mut turn_context) = make_session_and_context().await;
     std::fs::create_dir_all(&turn_context.config.codex_home)
         .context("recreate codex home for hook fixtures")?;
     let script_path = turn_context
@@ -370,19 +366,45 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         .to_string(),
     )
     .context("write hooks.json")?;
+    let config_toml_path = turn_context
+        .config
+        .codex_home
+        .join(codex_config::CONFIG_TOML_FILE);
+    let hook_list = codex_hooks::list_hooks(HooksConfig {
+        feature_enabled: true,
+        config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
+        ..HooksConfig::default()
+    });
+    assert_eq!(hook_list.hooks.len(), 1);
+    let trusted_config_layer_stack = turn_context.config.config_layer_stack.with_user_config(
+        &config_toml_path,
+        serde_json::from_value(serde_json::json!({
+            "hooks": {
+                "state": {
+                    hook_list.hooks[0].key.clone(): {
+                        "trusted_hash": hook_list.hooks[0].current_hash.clone(),
+                    },
+                },
+            },
+        }))
+        .context("build trusted hook state")?,
+    );
 
     let mut hook_shell_argv = session
         .user_shell()
         .derive_exec_args("", /*use_login_shell*/ false);
     let hook_shell_program = hook_shell_argv.remove(0);
     let _ = hook_shell_argv.pop();
-    session.services.hooks = Hooks::new(HooksConfig {
-        feature_enabled: true,
-        config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
-        shell_program: Some(hook_shell_program),
-        shell_args: hook_shell_argv,
-        ..HooksConfig::default()
-    });
+    session
+        .services
+        .hooks
+        .store(Arc::new(Hooks::new(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(trusted_config_layer_stack),
+            shell_program: Some(hook_shell_program),
+            shell_args: hook_shell_argv,
+            ..HooksConfig::default()
+        })));
 
     turn_context.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     turn_context.permission_profile = PermissionProfile::from_runtime_permissions(
@@ -402,9 +424,7 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         call_id: "execve-hook-call".to_string(),
         tool_name: GuardianCommandSource::Shell,
         approval_policy: AskForApproval::OnRequest,
-        permission_profile: permission_profile_from_sandbox_policy(
-            &SandboxPolicy::new_read_only_policy(),
-        ),
+        permission_profile: PermissionProfile::read_only(),
         file_system_sandbox_policy: read_only_file_system_sandbox_policy(),
         sandbox_policy_cwd: workdir.clone(),
         sandbox_permissions: SandboxPermissions::RequireEscalated,
@@ -471,9 +491,7 @@ fn evaluate_intercepted_exec_policy_uses_wrapper_command_when_shell_wrapper_pars
         ],
         InterceptedExecPolicyContext {
             approval_policy: AskForApproval::OnRequest,
-            permission_profile: permission_profile_from_sandbox_policy(
-                &SandboxPolicy::new_read_only_policy(),
-            ),
+            permission_profile: PermissionProfile::read_only(),
             file_system_sandbox_policy: &read_only_file_system_sandbox_policy(),
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: SandboxPermissions::UseDefault,
@@ -526,9 +544,7 @@ fn evaluate_intercepted_exec_policy_matches_inner_shell_commands_when_enabled() 
         ],
         InterceptedExecPolicyContext {
             approval_policy: AskForApproval::OnRequest,
-            permission_profile: permission_profile_from_sandbox_policy(
-                &SandboxPolicy::new_read_only_policy(),
-            ),
+            permission_profile: PermissionProfile::read_only(),
             file_system_sandbox_policy: &read_only_file_system_sandbox_policy(),
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: SandboxPermissions::UseDefault,
@@ -572,9 +588,7 @@ host_executable(name = "git", paths = ["{git_path_literal}"])
         &["git".to_string(), "status".to_string()],
         InterceptedExecPolicyContext {
             approval_policy: AskForApproval::OnRequest,
-            permission_profile: permission_profile_from_sandbox_policy(
-                &SandboxPolicy::new_read_only_policy(),
-            ),
+            permission_profile: PermissionProfile::read_only(),
             file_system_sandbox_policy: &read_only_file_system_sandbox_policy(),
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: SandboxPermissions::UseDefault,
@@ -606,7 +620,7 @@ fn intercepted_exec_policy_treats_preapproved_additional_permissions_as_default(
     let program = AbsolutePathBuf::try_from(host_absolute_path(&["usr", "bin", "printf"])).unwrap();
     let argv = ["printf".to_string(), "hello".to_string()];
     let approval_policy = AskForApproval::OnRequest;
-    let sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+    let permission_profile = PermissionProfile::workspace_write();
     let file_system_sandbox_policy = read_only_file_system_sandbox_policy();
     let sandbox_cwd = test_sandbox_cwd();
 
@@ -616,7 +630,7 @@ fn intercepted_exec_policy_treats_preapproved_additional_permissions_as_default(
         &argv,
         InterceptedExecPolicyContext {
             approval_policy,
-            permission_profile: permission_profile_from_sandbox_policy(&sandbox_policy),
+            permission_profile: permission_profile.clone(),
             file_system_sandbox_policy: &file_system_sandbox_policy,
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: super::approval_sandbox_permissions(
@@ -632,7 +646,7 @@ fn intercepted_exec_policy_treats_preapproved_additional_permissions_as_default(
         &argv,
         InterceptedExecPolicyContext {
             approval_policy,
-            permission_profile: permission_profile_from_sandbox_policy(&sandbox_policy),
+            permission_profile,
             file_system_sandbox_policy: &file_system_sandbox_policy,
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
@@ -667,9 +681,7 @@ host_executable(name = "git", paths = ["{allowed_git_literal}"])
         &["git".to_string(), "status".to_string()],
         InterceptedExecPolicyContext {
             approval_policy: AskForApproval::OnRequest,
-            permission_profile: permission_profile_from_sandbox_policy(
-                &SandboxPolicy::new_read_only_policy(),
-            ),
+            permission_profile: PermissionProfile::read_only(),
             file_system_sandbox_policy: &read_only_file_system_sandbox_policy(),
             sandbox_cwd: sandbox_cwd.as_path(),
             sandbox_permissions: SandboxPermissions::UseDefault,

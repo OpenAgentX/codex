@@ -1,20 +1,22 @@
 mod compact;
-mod ghost_snapshot;
+mod lifecycle;
 mod regular;
 mod review;
-mod undo;
 mod user_shell;
 
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_extension_api::ExtensionData;
 use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
+use tracing::Span;
+use tracing::field;
 use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
@@ -54,10 +56,8 @@ use codex_protocol::user_input::UserInput;
 use codex_features::Feature;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
-pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
-pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
@@ -154,15 +154,23 @@ fn bool_tag(value: bool) -> &'static str {
 #[derive(Clone)]
 pub(crate) struct SessionTaskContext {
     session: Arc<Session>,
+    turn_extension_data: Arc<ExtensionData>,
 }
 
 impl SessionTaskContext {
-    pub(crate) fn new(session: Arc<Session>) -> Self {
-        Self { session }
+    pub(crate) fn new(session: Arc<Session>, turn_extension_data: Arc<ExtensionData>) -> Self {
+        Self {
+            session,
+            turn_extension_data,
+        }
     }
 
     pub(crate) fn clone_session(&self) -> Arc<Session> {
         Arc::clone(&self.session)
+    }
+
+    pub(crate) fn turn_extension_data(&self) -> Arc<ExtensionData> {
+        Arc::clone(&self.turn_extension_data)
     }
 
     pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
@@ -189,6 +197,11 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
 
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
+
+    /// Returns whether turn token usage should be recorded on this task's turn span.
+    fn records_turn_token_usage_on_span(&self) -> bool {
+        false
+    }
 
     /// Executes the task until completion or cancellation.
     ///
@@ -227,6 +240,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn records_turn_token_usage_on_span(&self) -> bool;
+
     fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -252,6 +267,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn records_turn_token_usage_on_span(&self) -> bool {
+        SessionTask::records_turn_token_usage_on_span(self)
     }
 
     fn run(
@@ -301,10 +320,13 @@ impl Session {
         let task_kind = task.kind();
         let span_name = task.span_name();
         let started_at = Instant::now();
-        turn_context
+        let turn_started_at_unix_ms = turn_context
             .turn_timing_state
             .mark_turn_started(started_at)
             .await;
+        turn_context
+            .turn_metadata_state
+            .set_turn_started_at_unix_ms(turn_started_at_unix_ms);
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
 
         let cancellation_token = CancellationToken::new();
@@ -343,23 +365,36 @@ impl Session {
                 turn_state.push_pending_input(item);
             }
         }
+        self.emit_turn_start_lifecycle(turn_context.extension_data.as_ref());
 
+        let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.tasks.is_empty());
         let done_clone = Arc::clone(&done);
-        let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
+        let session_ctx = Arc::new(SessionTaskContext::new(
+            Arc::clone(self),
+            Arc::clone(&turn_extension_data),
+        ));
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_cancellation_token = cancellation_token.child_token();
         // Task-owned turn spans keep a core-owned span open for the
         // full task lifecycle after the submission dispatch span ends.
+        let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
         let task_span = info_span!(
             "turn",
             otel.name = span_name,
             thread.id = %self.conversation_id,
             turn.id = %turn_context.sub_id,
             model = %turn_context.model_info.slug,
+            codex.turn.reasoning_effort = %reasoning_effort,
+            codex.turn.token_usage.input_tokens = field::Empty,
+            codex.turn.token_usage.cached_input_tokens = field::Empty,
+            codex.turn.token_usage.non_cached_input_tokens = field::Empty,
+            codex.turn.token_usage.output_tokens = field::Empty,
+            codex.turn.token_usage.reasoning_output_tokens = field::Empty,
+            codex.turn.token_usage.total_tokens = field::Empty,
         );
         let handle = tokio::spawn(
             async move {
@@ -405,6 +440,7 @@ impl Session {
             task,
             cancellation_token,
             turn_context: Arc::clone(&turn_context),
+            turn_extension_data,
             _timer: timer,
         };
         turn.add_task(running_task);
@@ -468,6 +504,9 @@ impl Session {
             }
         }
 
+        if let Some(turn_context) = turn_context.as_deref() {
+            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref());
+        }
         if (aborted_turn || reason == TurnAbortReason::Interrupted)
             && let Err(err) = self
                 .goal_runtime_apply(GoalRuntimeEvent::TaskAborted {
@@ -513,6 +552,9 @@ impl Session {
         for task in tasks {
             self.handle_task_abort(task, reason.clone()).await;
         }
+        if let Some(turn_context) = turn_context.as_deref() {
+            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref());
+        }
         if let Err(err) = self
             .goal_runtime_apply(GoalRuntimeEvent::TaskAborted {
                 turn_context: turn_context.as_deref(),
@@ -547,14 +589,20 @@ impl Session {
         let mut token_usage_at_turn_start = None;
         let mut turn_had_memory_citation = false;
         let mut turn_tool_calls = 0_u64;
+        let mut records_turn_token_usage_on_span = false;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             if let Some(at) = active.as_mut()
-                && at.remove_task(&turn_context.sub_id)
+                && let Some(removed_task) = at.remove_task(&turn_context.sub_id)
             {
-                should_clear_active_turn = true;
-                let turn_state = Arc::clone(&at.turn_state);
-                Some(turn_state)
+                records_turn_token_usage_on_span = removed_task.records_turn_token_usage_on_span;
+                if removed_task.active_turn_is_empty {
+                    should_clear_active_turn = true;
+                    let turn_state = Arc::clone(&at.turn_state);
+                    Some(turn_state)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -633,6 +681,33 @@ impl Session {
                     - token_usage_at_turn_start.total_tokens)
                     .max(0),
             };
+            if records_turn_token_usage_on_span {
+                let current_span = Span::current();
+                current_span.record(
+                    "codex.turn.token_usage.input_tokens",
+                    turn_token_usage.input_tokens,
+                );
+                current_span.record(
+                    "codex.turn.token_usage.cached_input_tokens",
+                    turn_token_usage.cached_input(),
+                );
+                current_span.record(
+                    "codex.turn.token_usage.non_cached_input_tokens",
+                    turn_token_usage.non_cached_input(),
+                );
+                current_span.record(
+                    "codex.turn.token_usage.output_tokens",
+                    turn_token_usage.output_tokens,
+                );
+                current_span.record(
+                    "codex.turn.token_usage.reasoning_output_tokens",
+                    turn_token_usage.reasoning_output_tokens,
+                );
+                current_span.record(
+                    "codex.turn.token_usage.total_tokens",
+                    turn_token_usage.total_tokens,
+                );
+            }
             self.services
                 .analytics_events_client
                 .track_turn_token_usage(TurnTokenUsageFact {
@@ -680,11 +755,13 @@ impl Session {
             .turn_timing_state
             .time_to_first_token_ms()
             .await;
+        if should_clear_active_turn {
+            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref());
+        }
         if let Err(err) = self
             .goal_runtime_apply(GoalRuntimeEvent::TurnFinished {
                 turn_context: turn_context.as_ref(),
                 turn_completed: should_clear_active_turn,
-                tool_calls: turn_tool_calls,
             })
             .await
         {
@@ -766,7 +843,10 @@ impl Session {
 
         task.handle.abort();
 
-        let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
+        let session_ctx = Arc::new(SessionTaskContext::new(
+            Arc::clone(self),
+            Arc::clone(&task.turn_extension_data),
+        ));
         session_task
             .abort(session_ctx, Arc::clone(&task.turn_context))
             .await;

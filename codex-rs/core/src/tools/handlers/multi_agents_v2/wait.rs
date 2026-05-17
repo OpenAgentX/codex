@@ -1,23 +1,38 @@
 use super::*;
+use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
+use crate::turn_timing::now_unix_timestamp_ms;
+use codex_tools::ToolSpec;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
 
-pub(crate) struct Handler;
+#[derive(Default)]
+pub(crate) struct Handler {
+    options: WaitAgentTimeoutOptions,
+}
 
-impl ToolHandler for Handler {
-    type Output = WaitAgentResult;
+impl Handler {
+    pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
+        Self { options }
+    }
+}
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for Handler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("wait_agent")
     }
 
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_wait_agent_tool_v2(self.options))
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -27,14 +42,22 @@ impl ToolHandler for Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-        let timeout_ms = match timeout_ms {
-            ms if ms <= 0 => {
-                return Err(FunctionCallError::RespondToModel(
-                    "timeout_ms must be greater than zero".to_owned(),
-                ));
+        let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
+        let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
+        let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
+        let timeout_ms = match args.timeout_ms {
+            Some(ms) if ms < min_timeout_ms => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "timeout_ms must be at least {min_timeout_ms}"
+                )));
             }
-            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+            Some(ms) if ms > max_timeout_ms => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "timeout_ms must be at most {max_timeout_ms}"
+                )));
+            }
+            Some(ms) => ms,
+            None => default_timeout_ms,
         };
 
         let mut mailbox_seq_rx = session.subscribe_mailbox_seq();
@@ -43,6 +66,7 @@ impl ToolHandler for Handler {
             .send_event(
                 &turn,
                 CollabWaitingBeginEvent {
+                    started_at_ms: now_unix_timestamp_ms(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_ids: Vec::new(),
                     receiver_agents: Vec::new(),
@@ -66,6 +90,7 @@ impl ToolHandler for Handler {
                 CollabWaitingEndEvent {
                     sender_thread_id: session.conversation_id,
                     call_id,
+                    completed_at_ms: now_unix_timestamp_ms(),
                     agent_statuses: Vec::new(),
                     statuses: HashMap::new(),
                 }
@@ -73,7 +98,13 @@ impl ToolHandler for Handler {
             )
             .await;
 
-        Ok(result)
+        Ok(boxed_tool_output(result))
+    }
+}
+
+impl CoreToolRuntime for Handler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
     }
 }
 
