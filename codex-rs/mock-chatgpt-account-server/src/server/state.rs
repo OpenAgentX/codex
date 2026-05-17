@@ -17,6 +17,7 @@ use crate::server::args::MockServerArgs;
 use crate::server::config::LoginUiConfig;
 use crate::server::config::OAuthSocialLoginProvider;
 use crate::server::config::SocialLoginProvider;
+use crate::server::remote_control::state::RelayState;
 use crate::server::responses_proxy::ResponsesProxy;
 
 pub const BROWSER_SESSION_COOKIE: &str = "mock_codex_browser_session";
@@ -43,6 +44,7 @@ pub struct AppState {
     pub args: MockServerArgs,
     login_ui_config: LoginUiConfig,
     responses_proxy: ResponsesProxy,
+    relay: RelayState,
     inner: Arc<RwLock<InnerState>>,
 }
 
@@ -134,8 +136,13 @@ impl AppState {
             args,
             login_ui_config,
             responses_proxy,
+            relay: RelayState::new(),
             inner: Arc::new(RwLock::new(InnerState::default())),
         }
+    }
+
+    pub(crate) fn relay(&self) -> &RelayState {
+        &self.relay
     }
 
     pub fn social_login_providers(&self) -> Vec<SocialLoginProvider> {

@@ -54,7 +54,9 @@ use crate::server::state::unix_now;
 type HttpRoute = BoxedFilter<(Response,)>;
 
 pub fn routes(state: AppState) -> HttpRoute {
-    websocket_routes(state.clone())
+    super::remote_control::routes(state.clone())
+        .or(websocket_routes(state.clone()))
+        .unify()
         .or(http_routes(state))
         .unify()
         .boxed()

@@ -60,6 +60,7 @@ members = [
     "memories/mcp",
     "memories/read",
     "memories/write",
+    "mock-chatgpt-account-server",
     "model-provider-info",
     "models-manager",
     "network-proxy",

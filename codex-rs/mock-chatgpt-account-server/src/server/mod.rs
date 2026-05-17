@@ -1,6 +1,7 @@
 mod args;
 mod config;
 mod frontend;
+mod remote_control;
 mod responses;
 mod responses_proxy;
 mod routes;
@@ -15,6 +16,44 @@ pub use args::MockServerArgs;
 use config::load_login_ui_config;
 use responses_proxy::ResponsesProxy;
 use state::AppState;
+
+pub mod testing {
+    //! Test-only helpers for spinning up the mock server in integration tests.
+    //! These intentionally bypass `MockServerArgs` resolution so tests can
+    //! bind to an ephemeral port and learn the bound address.
+
+    use std::net::SocketAddr;
+
+    use anyhow::Result;
+    use tokio::task::JoinHandle;
+
+    use super::AppState;
+    use super::MockServerArgs;
+    use super::config::load_login_ui_config;
+    use super::responses_proxy::ResponsesProxy;
+    use super::routes;
+
+    /// Spawn the mock server on an ephemeral port; return the bound address
+    /// plus a handle to the server task. The task ends when the runtime is
+    /// dropped or the listener errors.
+    pub async fn spawn(args: MockServerArgs) -> Result<(SocketAddr, JoinHandle<()>)> {
+        let login_ui_config = load_login_ui_config(args.social_login_config.as_deref())?;
+        let responses_proxy = ResponsesProxy::load(
+            args.social_login_config.as_deref(),
+            args.responses_upstream_base_url.as_deref(),
+            args.responses_upstream_api_key.as_deref(),
+        )?;
+        let state = AppState::new(args, login_ui_config, responses_proxy);
+        let bind_addr: SocketAddr = "127.0.0.1:0"
+            .parse()
+            .map_err(|err| anyhow::anyhow!("invalid bind address: {err}"))?;
+        let (addr, server) = warp::serve(routes::routes(state)).bind_ephemeral(bind_addr);
+        let handle = tokio::spawn(async move {
+            server.await;
+        });
+        Ok((addr, handle))
+    }
+}
 
 pub async fn run(args: MockServerArgs) -> Result<()> {
     let bind_addr = resolve_bind_addr(&args).await?;
