@@ -6,6 +6,9 @@ It is intentionally isolated from the existing `codex-*` library crates. The ser
 third-party dependencies plus an embedded React + TypeScript single-page app for the browser login,
 device authorization, and task detail pages.
 
+> 想快速验证 **Codex 远程控制（Phone → Codex）端到端链路**？跳到
+> [`REMOTE_CONTROL_GUIDE.md`](./REMOTE_CONTROL_GUIDE.md)。
+
 ## Run
 
 ```bash
