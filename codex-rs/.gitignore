@@ -8,3 +8,5 @@
 /target-arm64/
 /weixin_agent/accounts
 /weixin_agent/data
+/mock-chatgpt-account-server/social-login.toml
+/mock-chatgpt-account-server/client_secret_*.json
