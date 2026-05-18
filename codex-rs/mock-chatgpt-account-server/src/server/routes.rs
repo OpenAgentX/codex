@@ -129,6 +129,7 @@ async fn dispatch_http(
         (Method::GET, "/oauth/authorize") => handle_authorize(&state, &query, &headers).await,
         (Method::GET, "/oauth/logout") => handle_browser_logout(&state, &query, &headers).await,
         (Method::GET, "/codex/device") => handle_device_page(&state, &headers, None).await,
+        (Method::GET, "/codex/remote-control") => handle_remote_control_page(&state, &headers),
         (Method::GET, "/deviceauth/callback") => handle_callback_page(&headers),
         (Method::POST, "/oauth/login") => handle_browser_login(&state, &headers, &body).await,
         (Method::POST, "/oauth/login/shortcut") => {
@@ -911,6 +912,22 @@ fn handle_callback_page(headers: &HeaderMap) -> Response {
     respond_page(StatusCode::OK, headers, &PageBootstrap::Callback)
 }
 
+fn handle_remote_control_page(state: &AppState, headers: &HeaderMap) -> Response {
+    let origin = request_origin(state, headers);
+    let backend_base_url = format!("{origin}/backend-api");
+    let bootstrap = PageBootstrap::RemoteControl {
+        backend_base_url,
+        bearer_token: state.args.access_token.clone(),
+        account_id: state.args.chatgpt_account_id.clone(),
+        suggested_installation_id: format!("install-{}", uuid::Uuid::new_v4().simple()),
+        suggested_server_name: "Mock host".to_string(),
+        strict_account_header: state.args.strict_account_header,
+        protocol_version: crate::server::remote_control::protocol::REMOTE_CONTROL_PROTOCOL_VERSION
+            .to_string(),
+    };
+    respond_page(StatusCode::OK, headers, &bootstrap)
+}
+
 fn handle_usage(state: &AppState, headers: &HeaderMap) -> Response {
     if let Err(response) = require_chatgpt_auth(state, headers) {
         return response;
@@ -1555,6 +1572,47 @@ mod tests {
         let response = warp::test::request().path("/healthz").reply(&filter).await;
         let body = serde_json::from_slice::<Value>(response.body()).expect("healthz json");
         assert_eq!(body, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn remote_control_console_page_returns_bootstrap_payload() {
+        let filter = test_filter();
+        let response = warp::test::request()
+            .path("/codex/remote-control")
+            .header("Accept", "application/json")
+            .reply(&filter)
+            .await;
+        let body =
+            serde_json::from_slice::<Value>(response.body()).expect("remote-control bootstrap");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body.get("page").and_then(Value::as_str),
+            Some("remoteControl"),
+        );
+        assert_eq!(
+            body.get("protocolVersion").and_then(Value::as_str),
+            Some("3"),
+        );
+        // backendBaseUrl is built from the request host; default test host is
+        // "127.0.0.1:8765".
+        assert!(
+            body.get("backendBaseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .ends_with("/backend-api"),
+            "backendBaseUrl should end with /backend-api"
+        );
+        assert!(
+            body.get("suggestedInstallationId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .starts_with("install-"),
+            "suggestedInstallationId should start with 'install-'"
+        );
+        assert_eq!(
+            body.get("strictAccountHeader").and_then(Value::as_bool),
+            Some(false),
+        );
     }
 
     #[tokio::test]

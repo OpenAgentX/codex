@@ -107,6 +107,42 @@ pub(crate) fn has_bearer(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Browser-driven WebSocket clients (e.g. the in-tree React console) cannot
+/// attach `Authorization` headers to the handshake; the relay therefore lets
+/// WSS handlers accept the bearer token via the `bearer` query parameter as
+/// a dev fallback. Returns true if either the header *or* the query param
+/// supplies a non-empty bearer.
+pub(crate) fn has_bearer_with_query_fallback(
+    headers: &HeaderMap,
+    query: &[(String, String)],
+) -> bool {
+    if has_bearer(headers) {
+        return true;
+    }
+    query
+        .iter()
+        .find(|(k, _)| k == "bearer")
+        .map(|(_, v)| !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Symmetric fallback for any header the WSS handler reads: prefer the HTTP
+/// header, fall back to a query parameter of the same name.
+pub(crate) fn header_or_query(
+    headers: &HeaderMap,
+    query: &[(String, String)],
+    name: &str,
+) -> Option<String> {
+    if let Some(value) = header_value(headers, name) {
+        return Some(value);
+    }
+    query
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+}
+
 pub(crate) fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)

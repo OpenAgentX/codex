@@ -43,8 +43,8 @@ use warp::ws::WebSocket;
 use warp::ws::Ws;
 
 use crate::server::remote_control::RemoteControlRoute;
-use crate::server::remote_control::enroll::has_bearer;
-use crate::server::remote_control::enroll::header_value;
+use crate::server::remote_control::enroll::has_bearer_with_query_fallback;
+use crate::server::remote_control::enroll::header_or_query;
 use crate::server::remote_control::enroll::json_response;
 use crate::server::remote_control::enroll::unauthorized;
 use crate::server::remote_control::protocol::ClientId;
@@ -108,16 +108,17 @@ async fn validate(
     query: &str,
     headers: &HeaderMap,
 ) -> Result<Handshake, Response> {
-    if !has_bearer(headers) {
+    let params = parse_query(query);
+    if !has_bearer_with_query_fallback(headers, &params) {
         return Err(unauthorized());
     }
-    let Some(account_id) = header_value(headers, REMOTE_CONTROL_ACCOUNT_ID_HEADER) else {
+    let Some(account_id) = header_or_query(headers, &params, REMOTE_CONTROL_ACCOUNT_ID_HEADER)
+    else {
         return Err(unauthorized());
     };
     if state.args.strict_account_header && account_id != state.args.chatgpt_account_id {
         return Err(unauthorized());
     }
-    let params = parse_query(query);
     let Some(environment_id) = params
         .iter()
         .find(|(k, _)| k == "environment_id")

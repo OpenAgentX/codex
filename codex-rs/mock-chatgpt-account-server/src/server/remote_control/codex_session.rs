@@ -36,8 +36,8 @@ use warp::ws::WebSocket;
 use warp::ws::Ws;
 
 use crate::server::remote_control::RemoteControlRoute;
-use crate::server::remote_control::enroll::has_bearer;
-use crate::server::remote_control::enroll::header_value;
+use crate::server::remote_control::enroll::has_bearer_with_query_fallback;
+use crate::server::remote_control::enroll::header_or_query;
 use crate::server::remote_control::enroll::json_response;
 use crate::server::remote_control::enroll::unauthorized;
 use crate::server::remote_control::protocol::ClientId;
@@ -65,6 +65,7 @@ pub(crate) fn route(state: AppState) -> RemoteControlRoute {
     warp::path!("backend-api" / "wham" / "remote" / "control" / "server")
         .and(warp::get())
         .and(warp::ws())
+        .and(warp::query::raw().or(warp::any().map(String::new)).unify())
         .and(warp::header::headers_cloned())
         .and(with_state(state))
         .and_then(handle_upgrade)
@@ -73,10 +74,11 @@ pub(crate) fn route(state: AppState) -> RemoteControlRoute {
 
 async fn handle_upgrade(
     ws: Ws,
+    query: String,
     headers: HeaderMap,
     state: AppState,
 ) -> Result<Response, std::convert::Infallible> {
-    let handshake = match validate(&state, &headers).await {
+    let handshake = match validate(&state, &query, &headers).await {
         Ok(handshake) => handshake,
         Err(response) => return Ok(response),
     };
@@ -94,30 +96,45 @@ struct Handshake {
     subscribe_cursor: Option<String>,
 }
 
-async fn validate(state: &AppState, headers: &HeaderMap) -> Result<Handshake, Response> {
-    if !has_bearer(headers) {
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+async fn validate(
+    state: &AppState,
+    query: &str,
+    headers: &HeaderMap,
+) -> Result<Handshake, Response> {
+    let params = parse_query(query);
+    if !has_bearer_with_query_fallback(headers, &params) {
         return Err(unauthorized());
     }
-    let Some(account_id) = header_value(headers, REMOTE_CONTROL_ACCOUNT_ID_HEADER) else {
+    let Some(account_id) = header_or_query(headers, &params, REMOTE_CONTROL_ACCOUNT_ID_HEADER)
+    else {
         return Err(unauthorized());
     };
     if state.args.strict_account_header && account_id != state.args.chatgpt_account_id {
         return Err(unauthorized());
     }
-    let Some(installation_id) = header_value(headers, REMOTE_CONTROL_INSTALLATION_ID_HEADER) else {
+    let Some(installation_id) =
+        header_or_query(headers, &params, REMOTE_CONTROL_INSTALLATION_ID_HEADER)
+    else {
         return Err(json_response(
             StatusCode::BAD_REQUEST,
             &json!({ "error": format!("missing {REMOTE_CONTROL_INSTALLATION_ID_HEADER} header") }),
         ));
     };
-    let Some(server_id) = header_value(headers, REMOTE_CONTROL_SERVER_ID_HEADER) else {
+    let Some(server_id) = header_or_query(headers, &params, REMOTE_CONTROL_SERVER_ID_HEADER) else {
         return Err(json_response(
             StatusCode::BAD_REQUEST,
             &json!({ "error": format!("missing {REMOTE_CONTROL_SERVER_ID_HEADER} header") }),
         ));
     };
     let protocol_version =
-        header_value(headers, REMOTE_CONTROL_PROTOCOL_VERSION_HEADER).unwrap_or_default();
+        header_or_query(headers, &params, REMOTE_CONTROL_PROTOCOL_VERSION_HEADER)
+            .unwrap_or_default();
     if protocol_version != REMOTE_CONTROL_PROTOCOL_VERSION {
         return Err(json_response(
             StatusCode::UPGRADE_REQUIRED,
@@ -147,7 +164,8 @@ async fn validate(state: &AppState, headers: &HeaderMap) -> Result<Handshake, Re
         ));
     }
     let subscribe_cursor =
-        header_value(headers, REMOTE_CONTROL_SUBSCRIBE_CURSOR_HEADER).filter(|s| !s.is_empty());
+        header_or_query(headers, &params, REMOTE_CONTROL_SUBSCRIBE_CURSOR_HEADER)
+            .filter(|s| !s.is_empty());
     Ok(Handshake {
         server_id,
         subscribe_cursor,

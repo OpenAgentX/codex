@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, StrictMode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -58,11 +58,23 @@ type CallbackBootstrap = {
   page: "callback";
 };
 
+type RemoteControlBootstrap = {
+  page: "remoteControl";
+  backendBaseUrl: string;
+  bearerToken: string;
+  accountId: string;
+  suggestedInstallationId: string;
+  suggestedServerName: string;
+  strictAccountHeader: boolean;
+  protocolVersion: string;
+};
+
 type Bootstrap =
   | LoginBootstrap
   | AccountConfirmBootstrap
   | DeviceBootstrap
   | TaskBootstrap
+  | RemoteControlBootstrap
   | CallbackBootstrap;
 
 type LoginActionResponse = {
@@ -588,6 +600,755 @@ function CallbackPage() {
   );
 }
 
+// -----------------------------------------------------------------------------
+// Remote-control console
+// -----------------------------------------------------------------------------
+
+type LogDirection = "info" | "phone-out" | "phone-in" | "codex-out" | "codex-in" | "error";
+
+type LogEntry = {
+  id: number;
+  ts: string;
+  direction: LogDirection;
+  text: string;
+};
+
+type EnrollResult = {
+  serverId: string;
+  environmentId: string;
+};
+
+type LinkStatus = "idle" | "connecting" | "open" | "closing" | "closed" | "error";
+
+function nowStamp() {
+  const d = new Date();
+  const hh = d.getHours().toString().padStart(2, "0");
+  const mm = d.getMinutes().toString().padStart(2, "0");
+  const ss = d.getSeconds().toString().padStart(2, "0");
+  const ms = d.getMilliseconds().toString().padStart(3, "0");
+  return `${hh}:${mm}:${ss}.${ms}`;
+}
+
+function newClientId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `client-${crypto.randomUUID()}`;
+  }
+  return `client-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function newStreamId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `stream-${crypto.randomUUID()}`;
+  }
+  return `stream-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function statusLabel(status: LinkStatus) {
+  switch (status) {
+    case "idle":
+      return "未连接";
+    case "connecting":
+      return "正在连接...";
+    case "open":
+      return "已连接";
+    case "closing":
+      return "正在断开...";
+    case "closed":
+      return "已断开";
+    case "error":
+      return "错误";
+  }
+}
+
+function toWsUrl(baseHttpUrl: string, path: string) {
+  const url = new URL(path, baseHttpUrl.endsWith("/") ? baseHttpUrl : `${baseHttpUrl}/`);
+  if (url.protocol === "https:") url.protocol = "wss:";
+  else if (url.protocol === "http:") url.protocol = "ws:";
+  return url.toString();
+}
+
+function RemoteControlPage(props: { bootstrap: RemoteControlBootstrap }) {
+  const { bootstrap } = props;
+
+  // Enrollment form state.
+  const [bearer, setBearer] = useState(bootstrap.bearerToken);
+  const [accountId, setAccountId] = useState(bootstrap.accountId);
+  const [installationId, setInstallationId] = useState(bootstrap.suggestedInstallationId);
+  const [serverName, setServerName] = useState(bootstrap.suggestedServerName);
+  const [enrolled, setEnrolled] = useState<EnrollResult | null>(null);
+  const [enrollError, setEnrollError] = useState<string | null>(null);
+  const [enrolling, setEnrolling] = useState(false);
+
+  // Session state.
+  const [clientId, setClientId] = useState(newClientId);
+  const [streamId, setStreamId] = useState(newStreamId);
+  const [phoneStatus, setPhoneStatus] = useState<LinkStatus>("idle");
+  const [phoneCloseCode, setPhoneCloseCode] = useState<number | null>(null);
+  const phoneRef = useRef<WebSocket | null>(null);
+  const phoneSubscribeCursorRef = useRef<string | null>(null);
+  const phoneHighestSeqRef = useRef<number | null>(null);
+
+  // Codex-side WS (optional — lets the user simulate both ends in dev).
+  const [codexStatus, setCodexStatus] = useState<LinkStatus>("idle");
+  const [codexCloseCode, setCodexCloseCode] = useState<number | null>(null);
+  const codexRef = useRef<WebSocket | null>(null);
+  const codexSubscribeCursorRef = useRef<string | null>(null);
+
+  // Log + composer.
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const logSeqRef = useRef(0);
+  const [phoneDraft, setPhoneDraft] = useState(
+    JSON.stringify(
+      {
+        type: "client_message",
+        message: { jsonrpc: "2.0", method: "ping", id: 1 },
+      },
+      null,
+      2,
+    ),
+  );
+  const [codexDraft, setCodexDraft] = useState(
+    JSON.stringify(
+      {
+        type: "server_message",
+        message: { jsonrpc: "2.0", result: "hello from codex", id: 1 },
+        seq_id: 1,
+      },
+      null,
+      2,
+    ),
+  );
+
+  useEffect(() => {
+    document.title = "Remote Control Console";
+  }, []);
+
+  // Tear down sockets on unmount so navigating away doesn't leak them.
+  useEffect(() => {
+    return () => {
+      phoneRef.current?.close();
+      codexRef.current?.close();
+    };
+  }, []);
+
+  function append(direction: LogDirection, text: string) {
+    logSeqRef.current += 1;
+    setLog((prev) =>
+      [
+        ...prev,
+        { id: logSeqRef.current, ts: nowStamp(), direction, text } satisfies LogEntry,
+      ].slice(-500),
+    );
+  }
+
+  function clearLog() {
+    setLog([]);
+  }
+
+  async function handleEnroll(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setEnrolling(true);
+    setEnrollError(null);
+    try {
+      const url = `${bootstrap.backendBaseUrl}/wham/remote/control/server/enroll`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          "chatgpt-account-id": accountId,
+          "x-codex-installation-id": installationId,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          name: serverName,
+          os: "browser",
+          arch: navigator.platform || "unknown",
+          app_server_version: "console",
+          installation_id: installationId,
+        }),
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        setEnrollError(`HTTP ${response.status}: ${text || response.statusText}`);
+        append("error", `enroll failed: HTTP ${response.status} ${text}`);
+        return;
+      }
+      const payload = JSON.parse(text) as { server_id: string; environment_id: string };
+      setEnrolled({ serverId: payload.server_id, environmentId: payload.environment_id });
+      append(
+        "info",
+        `enroll OK — server_id=${payload.server_id} environment_id=${payload.environment_id}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setEnrollError(msg);
+      append("error", `enroll error: ${msg}`);
+    } finally {
+      setEnrolling(false);
+    }
+  }
+
+  function regenerateInstallationId() {
+    setInstallationId(`install-${Math.random().toString(36).slice(2, 12)}`);
+    setEnrolled(null);
+  }
+
+  function regenerateClientId() {
+    setClientId(newClientId());
+  }
+  function regenerateStreamId() {
+    setStreamId(newStreamId());
+  }
+
+  function noteCursorFromEnvelope(envelope: unknown, side: "phone" | "codex") {
+    if (typeof envelope !== "object" || envelope === null) return;
+    const value = (envelope as Record<string, unknown>).cursor;
+    if (typeof value === "string" && value.length > 0) {
+      if (side === "phone") phoneSubscribeCursorRef.current = value;
+      else codexSubscribeCursorRef.current = value;
+    }
+    const seqId = (envelope as Record<string, unknown>).seq_id;
+    if (side === "phone" && typeof seqId === "number") {
+      if (phoneHighestSeqRef.current === null || seqId > phoneHighestSeqRef.current) {
+        phoneHighestSeqRef.current = seqId;
+      }
+    }
+  }
+
+  function connectPhone() {
+    if (!enrolled) return;
+    if (phoneRef.current && phoneRef.current.readyState <= WebSocket.OPEN) return;
+
+    const url = new URL(
+      "wham/remote/control/client",
+      bootstrap.backendBaseUrl.endsWith("/")
+        ? bootstrap.backendBaseUrl
+        : `${bootstrap.backendBaseUrl}/`,
+    );
+    url.searchParams.set("environment_id", enrolled.environmentId);
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("stream_id", streamId);
+    if (phoneSubscribeCursorRef.current) {
+      url.searchParams.set("subscribe_cursor", phoneSubscribeCursorRef.current);
+    }
+    if (url.protocol === "https:") url.protocol = "wss:";
+    else if (url.protocol === "http:") url.protocol = "ws:";
+
+    // Browsers don't let us set Authorization / chatgpt-account-id headers on
+    // WebSocket handshakes. The Sec-WebSocket-Protocol negotiation is the
+    // canonical workaround the relay supports — but the mock currently
+    // requires those headers. As a dev convenience, forward them via query
+    // params; the relay accepts both shapes for the console use case.
+    url.searchParams.set("bearer", bearer);
+    url.searchParams.set("chatgpt-account-id", accountId);
+
+    append("info", `phone WSS → ${url.toString()}`);
+    setPhoneStatus("connecting");
+    setPhoneCloseCode(null);
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url.toString());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      append("error", `phone WSS error: ${msg}`);
+      setPhoneStatus("error");
+      return;
+    }
+    phoneRef.current = ws;
+    ws.onopen = () => setPhoneStatus("open");
+    ws.onerror = () => {
+      append("error", "phone WSS error event");
+    };
+    ws.onclose = (ev) => {
+      setPhoneStatus("closed");
+      setPhoneCloseCode(ev.code);
+      append("info", `phone WSS closed code=${ev.code} reason=${ev.reason || "(none)"}`);
+      if (phoneRef.current === ws) phoneRef.current = null;
+    };
+    ws.onmessage = (ev) => {
+      const text = typeof ev.data === "string" ? ev.data : "(binary)";
+      append("phone-in", text);
+      try {
+        noteCursorFromEnvelope(JSON.parse(text), "phone");
+      } catch {
+        // Non-JSON; relay sometimes emits raw close frames. Ignore.
+      }
+    };
+  }
+
+  function disconnectPhone() {
+    if (phoneRef.current) {
+      setPhoneStatus("closing");
+      phoneRef.current.close();
+    }
+  }
+
+  function connectCodex() {
+    if (!enrolled) return;
+    if (codexRef.current && codexRef.current.readyState <= WebSocket.OPEN) return;
+
+    const url = new URL(
+      "wham/remote/control/server",
+      bootstrap.backendBaseUrl.endsWith("/")
+        ? bootstrap.backendBaseUrl
+        : `${bootstrap.backendBaseUrl}/`,
+    );
+    if (url.protocol === "https:") url.protocol = "wss:";
+    else if (url.protocol === "http:") url.protocol = "ws:";
+    if (codexSubscribeCursorRef.current) {
+      url.searchParams.set("subscribe_cursor", codexSubscribeCursorRef.current);
+    }
+    url.searchParams.set("bearer", bearer);
+    url.searchParams.set("chatgpt-account-id", accountId);
+    url.searchParams.set("x-codex-installation-id", installationId);
+    url.searchParams.set("x-codex-server-id", enrolled.serverId);
+    url.searchParams.set("x-codex-protocol-version", bootstrap.protocolVersion);
+
+    append("info", `codex WSS → ${url.toString()}`);
+    setCodexStatus("connecting");
+    setCodexCloseCode(null);
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url.toString());
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      append("error", `codex WSS error: ${msg}`);
+      setCodexStatus("error");
+      return;
+    }
+    codexRef.current = ws;
+    ws.onopen = () => setCodexStatus("open");
+    ws.onerror = () => append("error", "codex WSS error event");
+    ws.onclose = (ev) => {
+      setCodexStatus("closed");
+      setCodexCloseCode(ev.code);
+      append("info", `codex WSS closed code=${ev.code} reason=${ev.reason || "(none)"}`);
+      if (codexRef.current === ws) codexRef.current = null;
+    };
+    ws.onmessage = (ev) => {
+      const text = typeof ev.data === "string" ? ev.data : "(binary)";
+      append("codex-in", text);
+      try {
+        noteCursorFromEnvelope(JSON.parse(text), "codex");
+      } catch {
+        // ignore parse errors
+      }
+    };
+  }
+
+  function disconnectCodex() {
+    if (codexRef.current) {
+      setCodexStatus("closing");
+      codexRef.current.close();
+    }
+  }
+
+  function sendFromPhone() {
+    const ws = phoneRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      append("error", "phone not connected");
+      return;
+    }
+    const text = buildEnvelopeFromDraft(phoneDraft, clientId, streamId, "phone");
+    if (text === null) return;
+    ws.send(text);
+    append("phone-out", text);
+  }
+
+  function sendFromCodex() {
+    const ws = codexRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      append("error", "codex not connected");
+      return;
+    }
+    const text = buildEnvelopeFromDraft(codexDraft, clientId, streamId, "codex");
+    if (text === null) return;
+    ws.send(text);
+    append("codex-out", text);
+  }
+
+  function buildEnvelopeFromDraft(
+    draft: string,
+    cId: string,
+    sId: string,
+    side: "phone" | "codex",
+  ): string | null {
+    let parsed: Record<string, unknown>;
+    try {
+      const value = JSON.parse(draft);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("envelope must be a JSON object");
+      }
+      parsed = value as Record<string, unknown>;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      append("error", `invalid JSON: ${msg}`);
+      return null;
+    }
+    if (typeof parsed.client_id !== "string") parsed.client_id = cId;
+    if (typeof parsed.stream_id !== "string") parsed.stream_id = sId;
+    if (side === "codex" && typeof parsed.seq_id !== "number") {
+      parsed.seq_id = 1;
+    }
+    return JSON.stringify(parsed);
+  }
+
+  function sendAckFromPhone() {
+    if (!phoneRef.current || phoneRef.current.readyState !== WebSocket.OPEN) {
+      append("error", "phone not connected");
+      return;
+    }
+    const highest = phoneHighestSeqRef.current;
+    if (highest === null) {
+      append("error", "no seq_id seen yet — cannot ack");
+      return;
+    }
+    const payload = {
+      type: "ack",
+      client_id: clientId,
+      stream_id: streamId,
+      seq_id: highest,
+    };
+    const text = JSON.stringify(payload);
+    phoneRef.current.send(text);
+    append("phone-out", text);
+  }
+
+  function sendClientClosedFromPhone(scope: "stream" | "client") {
+    if (!phoneRef.current || phoneRef.current.readyState !== WebSocket.OPEN) {
+      append("error", "phone not connected");
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      type: "client_closed",
+      client_id: clientId,
+    };
+    if (scope === "stream") {
+      payload.stream_id = streamId;
+    }
+    const text = JSON.stringify(payload);
+    phoneRef.current.send(text);
+    append("phone-out", text);
+  }
+
+  const phoneCanConnect = enrolled !== null && phoneStatus !== "open" && phoneStatus !== "connecting";
+  const phoneCanDisconnect = phoneStatus === "open" || phoneStatus === "connecting";
+  const codexCanConnect = enrolled !== null && codexStatus !== "open" && codexStatus !== "connecting";
+  const codexCanDisconnect = codexStatus === "open" || codexStatus === "connecting";
+
+  return (
+    <main className="page-shell">
+      <section className="hero-panel">
+        <p className="eyebrow">Remote Control Console</p>
+        <h1>wham/remote/control 调试控制台</h1>
+        <p className="lead">
+          注册 Codex 远控 server，并在浏览器里同时驱动 Phone / Codex 两端的 WebSocket，用来端到端验证
+          mock relay 的行为（enroll、cursor 重放、ack 裁剪、ClientClosed 清理等）。
+        </p>
+
+        <section className="content-card">
+          <h2>1. Enroll</h2>
+          <form className="inline-form" onSubmit={handleEnroll} style={{ flexWrap: "wrap" }}>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>Bearer token</span>
+              <input
+                onChange={(e) => setBearer(e.target.value)}
+                placeholder="access token"
+                style={{ minWidth: 260 }}
+                value={bearer}
+              />
+            </label>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>chatgpt-account-id</span>
+              <input
+                onChange={(e) => setAccountId(e.target.value)}
+                placeholder="org-debug"
+                style={{ minWidth: 200 }}
+                value={accountId}
+              />
+            </label>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>installation_id</span>
+              <input
+                onChange={(e) => setInstallationId(e.target.value)}
+                style={{ minWidth: 260 }}
+                value={installationId}
+              />
+            </label>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>server name</span>
+              <input
+                onChange={(e) => setServerName(e.target.value)}
+                style={{ minWidth: 200 }}
+                value={serverName}
+              />
+            </label>
+            <button className="primary-button" disabled={enrolling} type="submit">
+              {enrolling ? "Enrolling..." : "Enroll"}
+            </button>
+            <button
+              className="secondary-button"
+              onClick={(e) => {
+                e.preventDefault();
+                regenerateInstallationId();
+              }}
+              type="button"
+            >
+              新 installation_id
+            </button>
+          </form>
+          {enrollError ? <p className="flash">{enrollError}</p> : null}
+          {enrolled ? (
+            <div className="table-card">
+              <div className="table-title">
+                <strong>已注册</strong>
+                <span>幂等键 = (account_id, installation_id, name)</span>
+              </div>
+              <table>
+                <tbody>
+                  <tr>
+                    <th style={{ width: 180 }}>server_id</th>
+                    <td>
+                      <code>{enrolled.serverId}</code>
+                    </td>
+                  </tr>
+                  <tr>
+                    <th>environment_id</th>
+                    <td>
+                      <code>{enrolled.environmentId}</code>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          <p style={{ marginTop: 12, fontSize: 13, color: "var(--muted)" }}>
+            后端: <code>{bootstrap.backendBaseUrl}</code> · 协议: <code>v{bootstrap.protocolVersion}</code> · strict-account-header:{" "}
+            <code>{bootstrap.strictAccountHeader ? "true" : "false"}</code>
+          </p>
+        </section>
+
+        <section className="content-card">
+          <h2>2. Phone WSS</h2>
+          <p className="lead" style={{ marginBottom: 12 }}>
+            模拟 ChatGPT App 端连接 <code>/wham/remote/control/client</code>。状态:{" "}
+            <strong>{statusLabel(phoneStatus)}</strong>
+            {phoneCloseCode !== null ? <> · 上次关闭 code <code>{phoneCloseCode}</code></> : null}
+          </p>
+          <div className="inline-form" style={{ flexWrap: "wrap" }}>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>client_id</span>
+              <input onChange={(e) => setClientId(e.target.value)} style={{ minWidth: 260 }} value={clientId} />
+            </label>
+            <button className="secondary-button" onClick={regenerateClientId} type="button">
+              新 client_id
+            </button>
+            <label>
+              <span style={{ display: "block", fontSize: 12, color: "var(--muted)" }}>stream_id</span>
+              <input onChange={(e) => setStreamId(e.target.value)} style={{ minWidth: 260 }} value={streamId} />
+            </label>
+            <button className="secondary-button" onClick={regenerateStreamId} type="button">
+              新 stream_id
+            </button>
+            <button
+              className="primary-button"
+              disabled={!phoneCanConnect}
+              onClick={connectPhone}
+              type="button"
+            >
+              连接 Phone
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!phoneCanDisconnect}
+              onClick={disconnectPhone}
+              type="button"
+            >
+              断开 Phone
+            </button>
+          </div>
+          <p style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
+            订阅游标 (subscribe_cursor):{" "}
+            <code>{phoneSubscribeCursorRef.current ?? "—"}</code> · 已观察 seq_id 最大值:{" "}
+            <code>{phoneHighestSeqRef.current ?? "—"}</code>
+          </p>
+          <div style={{ marginTop: 12 }}>
+            <span style={{ display: "block", fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>
+              要从 Phone 发出的 envelope (JSON)
+            </span>
+            <textarea
+              onChange={(e) => setPhoneDraft(e.target.value)}
+              rows={8}
+              style={{
+                width: "100%",
+                fontFamily: "Berkeley Mono, SFMono-Regular, Consolas, monospace",
+                background: "rgba(27, 28, 30, 0.04)",
+                border: "1px solid var(--line)",
+                borderRadius: 8,
+                padding: 10,
+              }}
+              value={phoneDraft}
+            />
+          </div>
+          <div className="inline-form" style={{ marginTop: 8 }}>
+            <button className="primary-button" onClick={sendFromPhone} type="button">
+              Phone → 发送
+            </button>
+            <button className="secondary-button" onClick={sendAckFromPhone} type="button">
+              发送 Ack(最高 seq_id)
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => sendClientClosedFromPhone("stream")}
+              type="button"
+            >
+              ClientClosed (this stream)
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => sendClientClosedFromPhone("client")}
+              type="button"
+            >
+              ClientClosed (all streams)
+            </button>
+          </div>
+        </section>
+
+        <section className="content-card">
+          <h2>3. Codex WSS (可选)</h2>
+          <p className="lead" style={{ marginBottom: 12 }}>
+            把浏览器伪装成 Codex 本地端连接 <code>/wham/remote/control/server</code>，用来给同环境下
+            的 Phone 发回包。状态: <strong>{statusLabel(codexStatus)}</strong>
+            {codexCloseCode !== null ? <> · 上次关闭 code <code>{codexCloseCode}</code></> : null}
+          </p>
+          <div className="inline-form" style={{ flexWrap: "wrap" }}>
+            <button
+              className="primary-button"
+              disabled={!codexCanConnect}
+              onClick={connectCodex}
+              type="button"
+            >
+              连接 Codex
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!codexCanDisconnect}
+              onClick={disconnectCodex}
+              type="button"
+            >
+              断开 Codex
+            </button>
+          </div>
+          <p style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
+            订阅游标 (x-codex-subscribe-cursor):{" "}
+            <code>{codexSubscribeCursorRef.current ?? "—"}</code>
+          </p>
+          <div style={{ marginTop: 12 }}>
+            <span style={{ display: "block", fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>
+              要从 Codex 发出的 envelope (JSON)
+            </span>
+            <textarea
+              onChange={(e) => setCodexDraft(e.target.value)}
+              rows={8}
+              style={{
+                width: "100%",
+                fontFamily: "Berkeley Mono, SFMono-Regular, Consolas, monospace",
+                background: "rgba(27, 28, 30, 0.04)",
+                border: "1px solid var(--line)",
+                borderRadius: 8,
+                padding: 10,
+              }}
+              value={codexDraft}
+            />
+          </div>
+          <div className="inline-form" style={{ marginTop: 8 }}>
+            <button className="primary-button" onClick={sendFromCodex} type="button">
+              Codex → 发送
+            </button>
+          </div>
+        </section>
+
+        <section className="content-card">
+          <h2>4. Log</h2>
+          <div className="inline-form" style={{ marginBottom: 8 }}>
+            <button className="secondary-button" onClick={clearLog} type="button">
+              清空
+            </button>
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>
+              最近 500 条 · phone-out / codex-out 是浏览器发出, *-in 是收到
+            </span>
+          </div>
+          <div
+            style={{
+              maxHeight: 360,
+              overflowY: "auto",
+              border: "1px solid var(--line)",
+              borderRadius: 8,
+              background: "rgba(255,255,255,0.6)",
+            }}
+          >
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 120 }}>时间</th>
+                  <th style={{ width: 110 }}>方向</th>
+                  <th>内容</th>
+                </tr>
+              </thead>
+              <tbody>
+                {log.length === 0 ? (
+                  <tr>
+                    <td colSpan={3}>暂无消息。</td>
+                  </tr>
+                ) : (
+                  log
+                    .slice()
+                    .reverse()
+                    .map((entry) => (
+                      <tr key={entry.id}>
+                        <td>
+                          <code>{entry.ts}</code>
+                        </td>
+                        <td>
+                          <span style={{ color: directionColor(entry.direction) }}>{entry.direction}</span>
+                        </td>
+                        <td>
+                          <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+                            {entry.text}
+                          </pre>
+                        </td>
+                      </tr>
+                    ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function directionColor(direction: LogDirection) {
+  switch (direction) {
+    case "phone-out":
+      return "#1d4ed8";
+    case "phone-in":
+      return "#0f766e";
+    case "codex-out":
+      return "#7c3aed";
+    case "codex-in":
+      return "#b45309";
+    case "error":
+      return "#9f1239";
+    default:
+      return "var(--muted)";
+  }
+}
+
 function App() {
   const bootstrap = readBootstrap();
 
@@ -602,6 +1363,9 @@ function App() {
   }
   if (bootstrap.page === "taskView") {
     return <TaskPage bootstrap={bootstrap} />;
+  }
+  if (bootstrap.page === "remoteControl") {
+    return <RemoteControlPage bootstrap={bootstrap} />;
   }
   return <CallbackPage />;
 }
